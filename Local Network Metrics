@@ -1,1 +1,185 @@
-A
+# =============================================================================
+# SECTION 2: LOCAL NETWORK METRICS (FULL GRAPH)
+# =============================================================================
+# Compute classical network metrics on the directed CitiBike full graph:
+# degree, strength, PageRank, betweenness, clustering, net flow.
+# Visualize each metric as a geographic scatter over the NYC basemap.
+# =============================================================================
+
+# Safety: remove self-loops before metric computation
+G.remove_edges_from(nx.selfloop_edges(G))
+
+print("|V| =", G.number_of_nodes())
+print("|E| =", G.number_of_edges())
+
+# Unweighted and weighted degree measures
+in_deg  = dict(G.in_degree())                  # incoming neighbor count
+out_deg = dict(G.out_degree())                 # outgoing neighbor count
+in_str  = dict(G.in_degree(weight='weight'))   # total incoming trip volume
+out_str = dict(G.out_degree(weight='weight'))  # total outgoing trip volume
+
+# PageRank on directed weighted graph (edge weights as transition probabilities)
+pr = nx.pagerank(G, weight='weight')
+
+# Betweenness centrality with inverted weights (higher trips -> shorter effective path)
+G_cost = G.copy()
+for u, v, d in G_cost.edges(data=True):
+    w = d.get('weight', 1.0)
+    d['cost'] = 1.0 / max(w, 1e-9)
+
+btw = nx.betweenness_centrality(G_cost, weight='cost', normalized=True)
+
+# Clustering coefficient computed on undirected projection (NetworkX limitation)
+clust = nx.clustering(G.to_undirected(), weight='weight')
+
+# Aggregate all metrics into a single node-level DataFrame
+metrics = pd.DataFrame({
+    'node': list(G.nodes()),
+    'in_deg':  [in_deg.get(n, 0) for n in G.nodes()],
+    'out_deg': [out_deg.get(n, 0) for n in G.nodes()],
+    'in_str':  [in_str.get(n, 0.0) for n in G.nodes()],
+    'out_str': [out_str.get(n, 0.0) for n in G.nodes()],
+    'pagerank': [pr.get(n, 0.0) for n in G.nodes()],
+    'betweenness': [btw.get(n, 0.0) for n in G.nodes()],
+    'clustering': [clust.get(n, 0.0) for n in G.nodes()],
+})
+
+# Net flow = outflow - inflow: positive = source station, negative = sink station
+metrics['net_strength'] = metrics['out_str'] - metrics['in_str']
+
+# Quick top-k inspections
+print("\nTop 10 PageRank:")
+display(metrics.sort_values('pagerank', ascending=False).head(10))
+
+print("\nTop 10 betweenness (bridges / connectors):")
+display(metrics.sort_values('betweenness', ascending=False).head(10))
+
+print("\nTop 10 sinks (most negative net_strength):")
+display(metrics.sort_values('net_strength').head(10))
+
+print("\nTop 10 sources (most positive net_strength):")
+display(metrics.sort_values('net_strength', ascending=False).head(10))
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+
+# Helper: scatter a metric over the NYC basemap with log/linear color scaling
+def plot_metric_on_map_clear(metrics_df, coords_df, value_col, title,
+                             map_path="nycmap.png",
+                             bbox_lonlat=(-74.30, -73.50, 40.40, 41.10),
+                             log_color=True,
+                             point_size=(6, 40),
+                             alpha=0.45,
+                             map_alpha=0.55,
+                             zoom_to_data=True):
+
+    df = (metrics_df.rename(columns={"node":"station"})
+                    .merge(coords_df, on="station", how="left")
+                    .dropna(subset=["lat","lng", value_col]))
+
+    x, y = mercator_xy(df["lng"].values, df["lat"].values)
+    df["x"], df["y"] = x, y
+
+    min_lon, max_lon, min_lat, max_lat = bbox_lonlat
+    xmin, ymin = mercator_xy(min_lon, min_lat)
+    xmax, ymax = mercator_xy(max_lon, max_lat)
+
+    # Log-transform color values when metric has heavy-tailed distribution
+    vals = df[value_col].astype(float).values
+    cvals = np.log1p(vals) if log_color else vals
+
+    # Size scaled to 5th-95th percentile range for robustness
+    lo, hi = np.nanpercentile(vals, [5, 95])
+    vals_clip = np.clip(vals, lo, hi)
+    smin, smax = point_size
+    sizes = smin + (smax - smin) * (vals_clip - lo) / (hi - lo + 1e-9)
+
+    img = mpimg.imread(map_path)
+    fig, ax = plt.subplots(figsize=(7,9))
+    ax.imshow(img, extent=[xmin, xmax, ymin, ymax], origin="upper", alpha=map_alpha)
+
+    sc = ax.scatter(df["x"], df["y"],
+                    s=sizes, c=cvals,
+                    alpha=alpha,
+                    linewidths=0,
+                    marker='o')
+
+    if zoom_to_data:
+        pad = 1500
+        ax.set_xlim(df["x"].min()-pad, df["x"].max()+pad)
+        ax.set_ylim(df["y"].min()-pad, df["y"].max()+pad)
+    else:
+        ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title(title)
+    ax.set_xlabel("Web Mercator X"); ax.set_ylabel("Web Mercator Y")
+    cbar = plt.colorbar(sc, ax=ax, fraction=0.03, pad=0.02)
+    cbar.set_label(f"log(1+{value_col})" if log_color else value_col)
+    plt.show()
+
+import pandas as pd
+
+# Build station coordinate lookup (merge of all unique start/end stations)
+starts = janData[['start_station_name','start_lat','start_lng']].rename(
+    columns={'start_station_name':'station','start_lat':'lat','start_lng':'lng'}
+)
+ends = janData[['end_station_name','end_lat','end_lng']].rename(
+    columns={'end_station_name':'station','end_lat':'lat','end_lng':'lng'}
+)
+coords = (pd.concat([starts, ends], ignore_index=True)
+            .dropna(subset=['lat','lng'])
+            .drop_duplicates(subset=['station']))
+
+TOPK = 500
+bbox = (-74.30, -73.50, 40.40, 41.10)
+
+# Plot top-K stations for a given metric
+def plot_topk(metric, title, log_color, size=(15,120), alpha=0.75):
+    top_df = metrics.sort_values(metric, ascending=False).head(TOPK)
+    plot_metric_on_map_clear(
+        top_df,
+        coords,
+        value_col=metric,
+        title=f"Top {TOPK} CitiBike Stations ({title}) - Jan 2023",
+        bbox_lonlat=bbox,
+        log_color=log_color,
+        point_size=size,
+        alpha=alpha,
+        map_alpha=0.55
+    )
+
+# Produce a map for each key metric
+plot_topk(metric="pagerank", title="PageRank Centrality", log_color=False)
+plot_topk(metric="betweenness", title="Betweenness Centrality", log_color=False)
+plot_topk(metric="in_str", title="In-Strength", log_color=True)
+plot_topk(metric="out_str", title="Out-Strength", log_color=True)
+plot_topk(metric="net_strength", title="Net Flow", log_color=False, size=(15,130))
+plot_topk(metric="clustering", title="Local Clustering Coefficient", log_color=False, size=(15,90))
+
+# Tabular top-10 by in-strength and out-strength
+required_cols = {"node", "in_str", "out_str"}
+missing = required_cols - set(metrics.columns)
+if missing:
+    raise ValueError(f"metrics is missing columns: {missing}")
+
+top10_in = (
+    metrics
+    .sort_values("in_str", ascending=False)
+    .head(10)
+    [["node", "in_str"]]
+)
+
+top10_out = (
+    metrics
+    .sort_values("out_str", ascending=False)
+    .head(10)
+    [["node", "out_str"]]
+)
+
+print("\nTop 10 Stations by In-Strength (Incoming Trips):")
+print(top10_in.to_string(index=False))
+
+print("\nTop 10 Stations by Out-Strength (Outgoing Trips):")
+print(top10_out.to_string(index=False))
