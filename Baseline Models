@@ -1,1 +1,180 @@
-A
+# =============================================================================
+# SECTION 6: BASELINE MODELING
+# =============================================================================
+# Compare MagNet against simpler baselines (global mean, linear regression)
+# on random splits of the January 2023 dataset.
+# =============================================================================
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.linear_model import LinearRegression
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+import warnings
+warnings.filterwarnings('ignore')
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# -----------------------------------------------------------------------------
+# 6.1 Rebuild full-graph edges/features/split for baseline comparison
+# -----------------------------------------------------------------------------
+
+print("\n" + "=" * 60)
+print("SECTION B: Baseline Models")
+print("=" * 60)
+
+# Rebuild the directed edge table (full graph, no threshold)
+edges_fg = (
+    janData.groupby(["start_station_name", "end_station_name"])
+           .size().reset_index(name="w_uv")
+           .rename(columns={"start_station_name":"src", "end_station_name":"dst"})
+)
+edges_fg = edges_fg[edges_fg["src"] != edges_fg["dst"]].copy()
+
+nodes_fg = pd.unique(pd.concat([edges_fg["src"], edges_fg["dst"]]))
+nodes_fg = list(nodes_fg)
+n_fg = len(nodes_fg)
+idx_fg = {s:i for i,s in enumerate(nodes_fg)}
+
+edges_fg["src_i"] = edges_fg["src"].map(idx_fg)
+edges_fg["dst_i"] = edges_fg["dst"].map(idx_fg)
+
+# Node features (match MagNet full-graph run)
+out_strength_fg = np.zeros(n_fg, dtype=np.float64)
+in_strength_fg  = np.zeros(n_fg, dtype=np.float64)
+out_degree_fg   = np.zeros(n_fg, dtype=np.float64)
+in_degree_fg    = np.zeros(n_fg, dtype=np.float64)
+
+np.add.at(out_strength_fg, edges_fg["src_i"].values, edges_fg["w_uv"].values)
+np.add.at(in_strength_fg,  edges_fg["dst_i"].values, edges_fg["w_uv"].values)
+
+od_fg = edges_fg.groupby("src_i")["dst_i"].nunique()
+id_fg = edges_fg.groupby("dst_i")["src_i"].nunique()
+out_degree_fg[od_fg.index.values] = od_fg.values
+in_degree_fg[id_fg.index.values]  = id_fg.values
+
+# Geographic coordinates
+starts_fg = janData[['start_station_name','start_lat','start_lng']].rename(
+    columns={'start_station_name':'station','start_lat':'lat','start_lng':'lng'})
+ends_fg = janData[['end_station_name','end_lat','end_lng']].rename(
+    columns={'end_station_name':'station','end_lat':'lat','end_lng':'lng'})
+coords_fg = (pd.concat([starts_fg, ends_fg], ignore_index=True)
+               .dropna(subset=['lat','lng'])
+               .drop_duplicates(subset=['station'])
+               .set_index('station'))
+
+lat_fg = np.array([coords_fg.loc[s,'lat'] if s in coords_fg.index else np.nan for s in nodes_fg], dtype=float)
+lng_fg = np.array([coords_fg.loc[s,'lng'] if s in coords_fg.index else np.nan for s in nodes_fg], dtype=float)
+lat_fg[np.isnan(lat_fg)] = np.nanmean(lat_fg)
+lng_fg[np.isnan(lng_fg)] = np.nanmean(lng_fg)
+
+X_fg = np.column_stack([in_degree_fg, out_degree_fg, in_strength_fg, out_strength_fg, lat_fg, lng_fg]).astype(np.float32)
+X_fg = (X_fg - X_fg.mean(axis=0, keepdims=True)) / (X_fg.std(axis=0, keepdims=True) + 1e-6)
+
+# Targets and random 80/20 split
+src_fg = edges_fg["src_i"].values.astype(np.int64)
+dst_fg = edges_fg["dst_i"].values.astype(np.int64)
+y_fg = np.log1p(edges_fg["w_uv"].values).astype(np.float32)
+
+E_fg = len(y_fg)
+
+np.random.seed(0)
+perm_fg = np.random.permutation(E_fg)
+train_E_fg = int(0.8 * E_fg)
+train_idx_fg = perm_fg[:train_E_fg]
+val_idx_fg   = perm_fg[train_E_fg:]
+
+train_src_fg = src_fg[train_idx_fg]
+train_dst_fg = dst_fg[train_idx_fg]
+train_y_fg   = y_fg[train_idx_fg]
+
+val_src_fg = src_fg[val_idx_fg]
+val_dst_fg = dst_fg[val_idx_fg]
+val_y_fg   = y_fg[val_idx_fg]
+
+# Standard metrics: MAE, RMSE, R², Pearson correlation
+def compute_metrics(y_true, y_pred):
+    mae  = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2   = r2_score(y_true, y_pred)
+    corr = float(np.corrcoef(y_true, y_pred)[0, 1]) if len(y_true) > 2 else 0.0
+    return {"MAE": mae, "RMSE": rmse, "R²": r2, "Pearson r": corr}
+
+# Edge feature helper for non-GNN baselines: concatenate src + dst node features
+def make_edge_features(src_arr, dst_arr, X_mat):
+    return np.hstack([X_mat[src_arr], X_mat[dst_arr]])
+
+train_feats = make_edge_features(train_src_fg, train_dst_fg, X_fg)
+val_feats   = make_edge_features(val_src_fg, val_dst_fg, X_fg)
+
+# -----------------------------------------------------------------------------
+# 6.2 Baseline 1: Global Mean
+# -----------------------------------------------------------------------------
+print("\n--- Baseline 1: Global Mean ---")
+global_mean = train_y_fg.mean()
+pred_mean = np.full_like(val_y_fg, global_mean)
+res_mean = compute_metrics(val_y_fg, pred_mean)
+print(f"  MAE={res_mean['MAE']:.4f}  RMSE={res_mean['RMSE']:.4f}  R²={res_mean['R²']:.4f}  r={res_mean['Pearson r']:.4f}")
+
+# -----------------------------------------------------------------------------
+# 6.3 Baseline 2: Linear Regression on concatenated node features
+# -----------------------------------------------------------------------------
+print("\n--- Baseline 2: Linear Regression ---")
+lr_model = LinearRegression()
+lr_model.fit(train_feats, train_y_fg)
+pred_lr = lr_model.predict(val_feats)
+res_lr = compute_metrics(val_y_fg, pred_lr)
+print(f"  MAE={res_lr['MAE']:.4f}  RMSE={res_lr['RMSE']:.4f}  R²={res_lr['R²']:.4f}  r={res_lr['Pearson r']:.4f}")
+
+# -----------------------------------------------------------------------------
+# 6.4 Re-run MagNet (q=0.25) on same split for apples-to-apples comparison
+# -----------------------------------------------------------------------------
+print("\n--- MagNet (q=0.25) — re-evaluated on same split ---")
+
+T_fg = (A_fg_dense - A_fg_dense.T) / (A_fg_dense + A_fg_dense.T + eps)
+Theta_fg = 2 * np.pi * 0.25 * T_fg
+A_mag_fg = W_sym * np.exp(1j * Theta_fg)
+
+w_c_fg = A_mag_fg[rows_gcn, cols_gcn] * (inv_sqrt_sym[rows_gcn] * inv_sqrt_sym[cols_gcn])
+ewr_mag = np.real(w_c_fg).astype(np.float32)[mask_gcn]
+ewi_mag = np.imag(w_c_fg).astype(np.float32)[mask_gcn]
+
+ewr_mag_t = torch.tensor(ewr_mag, dtype=torch.float32, device=device)
+ewi_mag_t = torch.tensor(ewi_mag, dtype=torch.float32, device=device)
+
+model_mag = MagNet(in_dim=x_gcn_t.size(1), hidden_dim=64, layers=2, dropout=0.15).to(device)
+opt_mag = torch.optim.Adam(model_mag.parameters(), lr=1e-3, weight_decay=1e-4)
+loss_fn_mag = nn.SmoothL1Loss(beta=1.0)
+
+best_mag_corr = -1
+for epoch in range(1, 201):
+    model_mag.train()
+    opt_mag.zero_grad()
+    xr, xi = model_mag(x_gcn_t, src_gcn_t, dst_gcn_t, ewr_mag_t, ewi_mag_t)
+    pred = model_mag.predict_edges(xr, xi, src_gcn_t[train_idx_gcn], dst_gcn_t[train_idx_gcn])
+    loss = loss_fn_mag(pred, y_gcn_t[train_idx_gcn])
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model_mag.parameters(), 2.0)
+    opt_mag.step()
+
+    if epoch % 20 == 0:
+        model_mag.eval()
+        with torch.no_grad():
+            xr, xi = model_mag(x_gcn_t, src_gcn_t, dst_gcn_t, ewr_mag_t, ewi_mag_t)
+            vp = model_mag.predict_edges(xr, xi, src_gcn_t[val_idx_gcn], dst_gcn_t[val_idx_gcn])
+            vp_np = vp.cpu().numpy()
+            vt_np = y_gcn_t[val_idx_gcn].cpu().numpy()
+            vc = float(np.corrcoef(vp_np, vt_np)[0, 1])
+            if vc > best_mag_corr:
+                best_mag_corr = vc
+                best_mag_pred = vp_np.copy()
+                best_mag_true = vt_np.copy()
+        print(f"  MagNet Epoch {epoch:03d} | corr {vc:.3f}")
+
+res_mag = compute_metrics(best_mag_true, best_mag_pred)
+print(f"  Best MagNet: MAE={res_mag['MAE']:.4f}  RMSE={res_mag['RMSE']:.4f}  R²={res_mag['R²']:.4f}  r={res_mag['Pearson r']:.4f}")
