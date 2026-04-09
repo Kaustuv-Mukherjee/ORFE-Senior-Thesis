@@ -1,1 +1,1049 @@
-A
+# =============================================================================
+# SECTION 4: MAGNET CONSTRUCTION AND TRAINING
+# =============================================================================
+# Define the MagNet architecture (complex-valued message passing) and train it
+# on the January 2023 full graph. Also run cross-month (Jan→Feb 2023) and
+# cross-year (Jan 2023→Jan 2024) generalization experiments.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 4.1 Build node feature matrix on the subgraph (first pass)
+# -----------------------------------------------------------------------------
+
+# Structural features pulled from the metrics DataFrame
+metrics = metrics.set_index("node")
+
+in_deg  = metrics["in_deg"].values
+out_deg = metrics["out_deg"].values
+in_str  = metrics["in_str"].values
+out_str = metrics["out_str"].values
+pagerank = metrics["pagerank"].values
+betweenness = metrics["betweenness"].values
+clustering = metrics["clustering"].values
+
+# Geographic features
+coords_df = coords.set_index("station")
+lat = np.array([coords_df.loc[s, 'lat'] if s in coords_df.index else np.nan for s in nodes])
+lng = np.array([coords_df.loc[s, 'lng'] if s in coords_df.index else np.nan for s in nodes])
+
+lat[np.isnan(lat)] = np.nanmean(lat)
+lng[np.isnan(lng)] = np.nanmean(lng)
+
+X = np.column_stack([
+    in_deg,
+    out_deg,
+    in_str,
+    out_str,
+    pagerank,
+    betweenness,
+    clustering,
+    lat,
+    lng
+]).astype(np.float32)
+
+# Z-score standardization
+X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-6)
+
+print("Feature matrix shape:", X.shape)
+
+# Convert adjacency to edge list with complex edge weights
+rows, cols = np.nonzero(A > 0)
+E = len(rows)
+
+w_complex = A_mag[rows, cols]
+ew_r = np.real(w_complex).astype(np.float32)
+ew_i = np.imag(w_complex).astype(np.float32)
+
+y = np.log1p(A[rows, cols]).astype(np.float32)
+
+print("Edges:", E)
+
+# -----------------------------------------------------------------------------
+# 4.2 Magnetic normalization, MagNet architecture, and subgraph training
+# -----------------------------------------------------------------------------
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Rebuild X from already-indexed metrics DataFrame (prevents KeyError on re-run)
+metrics_ = metrics
+
+in_deg  = metrics_["in_deg"].values
+out_deg = metrics_["out_deg"].values
+in_str  = metrics_["in_str"].values
+out_str = metrics_["out_str"].values
+pagerank = metrics_["pagerank"].values
+betweenness = metrics_["betweenness"].values
+clustering = metrics_["clustering"].values
+
+coords_ = coords.set_index("station")
+lat = np.array([coords_.loc[s, 'lat'] if s in coords_.index else np.nan for s in nodes], dtype=float)
+lng = np.array([coords_.loc[s, 'lng'] if s in coords_.index else np.nan for s in nodes], dtype=float)
+lat[np.isnan(lat)] = np.nanmean(lat)
+lng[np.isnan(lng)] = np.nanmean(lng)
+
+X = np.column_stack([
+    in_deg, out_deg, in_str, out_str, pagerank, betweenness, clustering, lat, lng
+]).astype(np.float32)
+
+X = (X - X.mean(axis=0, keepdims=True)) / (X.std(axis=0, keepdims=True) + 1e-6)
+print("X shape:", X.shape)
+
+# Build normalized magnetic edge weights D^{-1/2} A_mag D^{-1/2} edgewise
+rows, cols = np.nonzero(A > 0)
+E = len(rows)
+print("Edges:", E)
+
+d_mag = W_s.sum(axis=1).astype(np.float64)
+inv_sqrt = 1.0 / np.sqrt(d_mag + 1e-8)
+
+w_complex = A_mag[rows, cols] * (inv_sqrt[rows] * inv_sqrt[cols])
+
+ew_r = np.real(w_complex).astype(np.float32)
+ew_i = np.imag(w_complex).astype(np.float32)
+
+# Target: log(weight); threshold > 100 gives better spread than log1p
+y = np.log(A[rows, cols]).astype(np.float32)
+
+# Move everything to GPU/CPU tensors
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+x_t = torch.tensor(X, dtype=torch.float32, device=device)
+
+src = torch.tensor(rows, dtype=torch.long, device=device)
+dst = torch.tensor(cols, dtype=torch.long, device=device)
+
+ewr = torch.tensor(ew_r, dtype=torch.float32, device=device)
+ewi = torch.tensor(ew_i, dtype=torch.float32, device=device)
+
+y_t = torch.tensor(y, dtype=torch.float32, device=device)
+
+# -----------------------------
+# MagNet layer: complex linear transformation + complex edge aggregation
+# -----------------------------
+class MagNetLayer(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.Wr = nn.Linear(in_dim, out_dim, bias=False)
+        self.Wi = nn.Linear(in_dim, out_dim, bias=False)
+        self.br = nn.Parameter(torch.zeros(out_dim))
+        self.bi = nn.Parameter(torch.zeros(out_dim))
+
+    def forward(self, xr, xi, src, dst, ewr, ewi, n_nodes):
+        # complex linear: (Wr + iWi)(xr + ixi)
+        zr = self.Wr(xr) - self.Wi(xi)
+        zi = self.Wr(xi) + self.Wi(xr)
+
+        # gather source embeddings
+        zr_u = zr[src]
+        zi_u = zi[src]
+
+        # complex edge-weight multiply
+        mr = ewr[:, None] * zr_u - ewi[:, None] * zi_u
+        mi = ewr[:, None] * zi_u + ewi[:, None] * zr_u
+
+        # scatter aggregate into destinations
+        out_r = torch.zeros((n_nodes, zr.size(1)), device=zr.device)
+        out_i = torch.zeros((n_nodes, zi.size(1)), device=zi.device)
+        out_r.index_add_(0, dst, mr)
+        out_i.index_add_(0, dst, mi)
+
+        out_r = out_r + self.br
+        out_i = out_i + self.bi
+        return out_r, out_i
+
+# -----------------------------
+# MagNet model: stacked layers + MLP edge readout
+# -----------------------------
+class MagNet(nn.Module):
+    def __init__(self, in_dim, hidden_dim=64, layers=2, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        self.layers.append(MagNetLayer(in_dim, hidden_dim))
+        for _ in range(layers - 1):
+            self.layers.append(MagNetLayer(hidden_dim, hidden_dim))
+        self.dropout = dropout
+
+        # Edge prediction head: concat [src_real, src_imag, dst_real, dst_imag]
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(4 * hidden_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x, src, dst, ewr, ewi):
+        n = x.size(0)
+        xr = x                              # real channel = input features
+        xi = torch.zeros_like(x)            # imaginary channel = zeros initially
+
+        for layer in self.layers:
+            xr, xi = layer(xr, xi, src, dst, ewr, ewi, n)
+            xr = F.relu(xr)
+            xi = F.relu(xi)
+            xr = F.dropout(xr, p=self.dropout, training=self.training)
+            xi = F.dropout(xi, p=self.dropout, training=self.training)
+
+        return xr, xi
+
+    def predict_edges(self, xr, xi, src_e, dst_e):
+        ur = xr[src_e]; ui = xi[src_e]
+        vr = xr[dst_e]; vi = xi[dst_e]
+        feat = torch.cat([ur, ui, vr, vi], dim=1)
+        return self.edge_mlp(feat).squeeze(-1)
+
+# -----------------------------
+# Train MagNet on subgraph with Huber loss + gradient clipping
+# -----------------------------
+torch.manual_seed(0)
+
+perm = torch.randperm(E, device=device)
+train_E = int(0.8 * E)
+train_idx = perm[:train_E]
+val_idx   = perm[train_E:]
+
+model = MagNet(in_dim=x_t.size(1), hidden_dim=64, layers=2, dropout=0.15).to(device)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+
+loss_fn = nn.SmoothL1Loss(beta=1.0)
+
+def eval_metrics(idx):
+    model.eval()
+    with torch.no_grad():
+        xr, xi = model(x_t, src, dst, ewr, ewi)
+        pred = model.predict_edges(xr, xi, src[idx], dst[idx])
+        loss = loss_fn(pred, y_t[idx]).item()
+
+        pred_np = pred.detach().cpu().numpy()
+        true_np = y_t[idx].detach().cpu().numpy()
+        corr = np.corrcoef(pred_np, true_np)[0, 1]
+        return loss, corr, (pred_np.min(), pred_np.max()), (true_np.min(), true_np.max())
+
+for epoch in range(1, 301):
+    model.train()
+    opt.zero_grad()
+
+    xr, xi = model(x_t, src, dst, ewr, ewi)
+    pred = model.predict_edges(xr, xi, src[train_idx], dst[train_idx])
+    loss = loss_fn(pred, y_t[train_idx])
+
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+    opt.step()
+
+    if epoch % 25 == 0:
+        val_loss, val_corr, pr_rng, yt_rng = eval_metrics(val_idx)
+        print(f"Epoch {epoch:03d} | Train {loss.item():.4f} | Val {val_loss:.4f} | Val corr {val_corr:.3f}")
+        print(f"   pred range {pr_rng} | true range {yt_rng}")
+
+# Final subgraph evaluation
+model.eval()
+with torch.no_grad():
+    xr, xi = model(x_t, src, dst, ewr, ewi)
+    val_pred = model.predict_edges(xr, xi, src[val_idx], dst[val_idx]).detach().cpu().numpy()
+    val_true = y_t[val_idx].detach().cpu().numpy()
+
+corr = np.corrcoef(val_pred, val_true)[0,1]
+print("Val correlation:", corr)
+print("Val pred range:", val_pred.min(), val_pred.max())
+print("Val true range:", val_true.min(), val_true.max())
+
+# -----------------------------------------------------------------------------
+# 4.3 Full-graph MagNet training (January 2023, all 1760 stations)
+# -----------------------------------------------------------------------------
+
+import numpy as np
+import pandas as pd
+
+# Rebuild directed edge table from raw trips (no threshold)
+edges = (
+    janData.groupby(["start_station_name", "end_station_name"])
+           .size()
+           .reset_index(name="w_uv")
+           .rename(columns={"start_station_name":"src", "end_station_name":"dst"})
+)
+
+# Drop self-loops
+edges = edges[edges["src"] != edges["dst"]].copy()
+
+print("Directed edges:", len(edges))
+print("Unique stations:", pd.unique(pd.concat([edges["src"], edges["dst"]])).size)
+
+import numpy as np
+import pandas as pd
+
+eps = 1e-9
+
+# Build node index over the full graph
+nodes = pd.unique(pd.concat([edges["src"], edges["dst"]]))
+nodes = list(nodes)
+n = len(nodes)
+idx = {s:i for i,s in enumerate(nodes)}
+
+# Merge with swapped columns to get reverse weights for each pair
+rev = edges.rename(columns={"src":"dst", "dst":"src", "w_uv":"w_vu"})
+pair = edges.merge(rev, on=["src","dst"], how="left")
+pair["w_vu"] = pair["w_vu"].fillna(0.0)
+
+# Create canonical unordered pair key to deduplicate
+a = pair["src"].map(idx).values
+b = pair["dst"].map(idx).values
+lo = np.minimum(a,b); hi = np.maximum(a,b)
+pair["u"] = lo
+pair["v"] = hi
+
+# Collapse to unique unordered pairs with both directional weights
+pair_uv = pair.groupby(["u","v"], as_index=False).agg(
+    w_ab=("w_uv","max"),   # forward direction
+    w_ba=("w_vu","max")    # reverse direction
+)
+
+# Symmetric magnitude W and skew orientation T
+W = 0.5*(pair_uv["w_ab"].values + pair_uv["w_ba"].values)
+T = (pair_uv["w_ab"].values - pair_uv["w_ba"].values) / (pair_uv["w_ab"].values + pair_uv["w_ba"].values + eps)
+
+q = 0.25
+Theta = 2*np.pi*q*T
+
+# Construct two directed edges per unordered pair (u->v and v->u with conjugate phases)
+u = pair_uv["u"].values.astype(np.int64)
+v = pair_uv["v"].values.astype(np.int64)
+
+src = np.concatenate([u, v])
+dst = np.concatenate([v, u])
+
+W_dir = np.concatenate([W, W])
+Theta_dir = np.concatenate([Theta, -Theta])
+
+# Complex magnetic edge weights (unnormalized)
+w_complex = W_dir * (np.cos(Theta_dir) + 1j*np.sin(Theta_dir))
+
+# Magnetic degree from symmetric magnitudes (each unordered pair counted once per node)
+d_mag = np.zeros(n, dtype=np.float64)
+np.add.at(d_mag, u, W)
+np.add.at(d_mag, v, W)
+
+inv_sqrt = 1.0 / np.sqrt(d_mag + 1e-8)
+
+# Normalized complex weights (edgewise D^{-1/2} A_mag D^{-1/2})
+w_complex_norm = w_complex * (inv_sqrt[src] * inv_sqrt[dst])
+
+ew_r = np.real(w_complex_norm).astype(np.float32)
+ew_i = np.imag(w_complex_norm).astype(np.float32)
+
+print("n =", n, "| undirected pairs =", len(pair_uv), "| directed edges =", len(src))
+
+import numpy as np
+import pandas as pd
+
+# Compute directed in/out strengths and degrees from the edge table
+edges["src_i"] = edges["src"].map(idx)
+edges["dst_i"] = edges["dst"].map(idx)
+
+out_strength = np.zeros(n, dtype=np.float64)
+in_strength  = np.zeros(n, dtype=np.float64)
+out_degree   = np.zeros(n, dtype=np.float64)
+in_degree    = np.zeros(n, dtype=np.float64)
+
+np.add.at(out_strength, edges["src_i"].values, edges["w_uv"].values)
+np.add.at(in_strength,  edges["dst_i"].values, edges["w_uv"].values)
+
+# Unique neighbor counts for degrees
+out_deg_series = edges.groupby("src_i")["dst_i"].nunique()
+in_deg_series  = edges.groupby("dst_i")["src_i"].nunique()
+out_degree[out_deg_series.index.values] = out_deg_series.values
+in_degree[in_deg_series.index.values]   = in_deg_series.values
+
+# Lat/lng lookup from all unique stations
+starts = janData[['start_station_name','start_lat','start_lng']].rename(
+    columns={'start_station_name':'station','start_lat':'lat','start_lng':'lng'}
+)
+ends = janData[['end_station_name','end_lat','end_lng']].rename(
+    columns={'end_station_name':'station','end_lat':'lat','end_lng':'lng'}
+)
+coords = (pd.concat([starts, ends], ignore_index=True)
+            .dropna(subset=['lat','lng'])
+            .drop_duplicates(subset=['station'])
+            .set_index('station'))
+
+lat = np.array([coords.loc[s,'lat'] if s in coords.index else np.nan for s in nodes], dtype=float)
+lng = np.array([coords.loc[s,'lng'] if s in coords.index else np.nan for s in nodes], dtype=float)
+lat[np.isnan(lat)] = np.nanmean(lat)
+lng[np.isnan(lng)] = np.nanmean(lng)
+
+# Build 6-feature node matrix (in_deg, out_deg, in_str, out_str, lat, lng)
+X = np.column_stack([in_degree, out_degree, in_strength, out_strength, lat, lng]).astype(np.float32)
+X = (X - X.mean(axis=0, keepdims=True)) / (X.std(axis=0, keepdims=True) + 1e-6)
+
+print("X:", X.shape)
+
+# Fast lookup to populate targets; drop synthetic reverse edges with zero weight
+w_lookup = {(int(s), int(t)): float(w) for s,t,w in zip(edges["src_i"], edges["dst_i"], edges["w_uv"])}
+
+y = np.array([np.log(w_lookup.get((int(s), int(t)), 0.0) + 1.0) for s,t in zip(src, dst)], dtype=np.float32)
+
+mask_obs = y > 0
+src_obs = src[mask_obs]; dst_obs = dst[mask_obs]
+ewr_obs = ew_r[mask_obs]; ewi_obs = ew_i[mask_obs]
+y_obs   = y[mask_obs]
+
+print("Observed directed edges (y>0):", len(y_obs))
+
+import torch
+import torch.nn as nn
+import numpy as np
+
+# Move all preprocessed graph data onto the chosen device as tensors
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+x_t = torch.tensor(X, dtype=torch.float32, device=device)
+src_t = torch.tensor(src_obs, dtype=torch.long, device=device)
+dst_t = torch.tensor(dst_obs, dtype=torch.long, device=device)
+ewr_t = torch.tensor(ewr_obs, dtype=torch.float32, device=device)
+ewi_t = torch.tensor(ewi_obs, dtype=torch.float32, device=device)
+y_t   = torch.tensor(y_obs, dtype=torch.float32, device=device)
+
+# Random 80/20 edge-level split
+E = y_t.numel()
+torch.manual_seed(0)
+perm = torch.randperm(E, device=device)
+train_E = int(0.8 * E)
+train_idx = perm[:train_E]
+val_idx   = perm[train_E:]
+
+model = MagNet(in_dim=x_t.size(1), hidden_dim=64, layers=2, dropout=0.15).to(device)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+loss_fn = nn.SmoothL1Loss(beta=1.0)
+
+train_hist = []
+val_hist = []
+corr_hist = []
+
+# Forward pass on validation edges, returning loss and Pearson correlation
+def eval_metrics():
+    model.eval()
+    with torch.no_grad():
+        xr, xi = model(x_t, src_t, dst_t, ewr_t, ewi_t)
+        pred = model.predict_edges(xr, xi, src_t[val_idx], dst_t[val_idx])
+        loss = loss_fn(pred, y_t[val_idx]).item()
+        vp = pred.detach().cpu().numpy()
+        vt = y_t[val_idx].detach().cpu().numpy()
+        corr = float(np.corrcoef(vp, vt)[0,1])
+        return loss, corr, (vp.min(), vp.max()), (vt.min(), vt.max())
+
+# Training loop: 300 epochs of full-batch gradient descent with gradient clipping
+for epoch in range(1, 301):
+    model.train()
+    opt.zero_grad()
+
+    xr, xi = model(x_t, src_t, dst_t, ewr_t, ewi_t)
+    pred = model.predict_edges(xr, xi, src_t[train_idx], dst_t[train_idx])
+    loss = loss_fn(pred, y_t[train_idx])
+
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+    opt.step()
+
+    # Every 20 epochs, evaluate on the validation set and log metrics
+    if epoch % 20 == 0:
+        vloss, vcorr, pr, tr = eval_metrics()
+        train_hist.append(loss.item()); val_hist.append(vloss); corr_hist.append(vcorr)
+        print(f"Epoch {epoch:03d} | train {loss.item():.4f} | val {vloss:.4f} | corr {vcorr:.3f}")
+        print(f"   pred range {pr} | true range {tr}")
+
+# Training curves
+import matplotlib.pyplot as plt
+
+plt.figure()
+plt.plot(np.arange(len(train_hist))*20+20, train_hist, label="train")
+plt.plot(np.arange(len(val_hist))*20+20, val_hist, label="val")
+plt.xlabel("epoch"); plt.ylabel("SmoothL1 loss"); plt.legend()
+plt.title("MagNet training (full graph)")
+plt.show()
+
+plt.figure()
+plt.plot(np.arange(len(corr_hist))*20+20, corr_hist)
+plt.xlabel("epoch"); plt.ylabel("val correlation")
+plt.title("Validation correlation over training")
+plt.show()
+
+# Final validation predictions
+model.eval()
+with torch.no_grad():
+    xr, xi = model(x_t, src_t, dst_t, ewr_t, ewi_t)
+    pred = model.predict_edges(xr, xi, src_t[val_idx], dst_t[val_idx]).detach().cpu().numpy()
+true = y_t[val_idx].detach().cpu().numpy()
+
+plt.figure()
+plt.scatter(true, pred, s=6, alpha=0.4)
+plt.xlabel("true log(1+flow)")
+plt.ylabel("pred log(1+flow)")
+plt.title("Validation: predicted vs true flows")
+plt.show()
+
+# Error analysis: most underpredicted and overpredicted edges
+err = pred - true
+order = np.argsort(err)
+
+val_src = src_obs[val_idx.detach().cpu().numpy()]
+val_dst = dst_obs[val_idx.detach().cpu().numpy()]
+
+def edge_table(idxs, title):
+    rows_out = []
+    for k in idxs[:15]:
+        s = int(val_src[order[k]])
+        t = int(val_dst[order[k]])
+        rows_out.append({
+            "src": nodes[s],
+            "dst": nodes[t],
+            "true_log1p": float(true[order[k]]),
+            "pred_log1p": float(pred[order[k]]),
+            "error": float(err[order[k]])
+        })
+    df = pd.DataFrame(rows_out)
+    print("\n" + title)
+    display(df)
+
+edge_table(order, "Most underpredicted edges (pred - true very negative)")
+edge_table(order[::-1], "Most overpredicted edges (pred - true very positive)")
+
+# Save model state and config for reproducibility
+import json, torch
+
+run_cfg = {
+    "q": 0.25,
+    "hidden_dim": 64,
+    "layers": 2,
+    "dropout": 0.15,
+    "loss": "SmoothL1(beta=1.0)",
+    "graph": "Jan2023 full directed (sparse)",
+}
+
+torch.save(model.state_dict(), "magnet_fullgraph_jan2023.pt")
+with open("magnet_fullgraph_jan2023_config.json", "w") as f:
+    json.dump(run_cfg, f, indent=2)
+print("Saved model + config")
+
+import pandas as pd
+import numpy as np
+
+# Save validation predictions with station names for analysis
+df_pred = pd.DataFrame({
+    "src": [nodes[int(i)] for i in val_src],
+    "dst": [nodes[int(i)] for i in val_dst],
+    "true_log1p": true.astype(float),
+    "pred_log1p": pred.astype(float),
+})
+df_pred["error"] = df_pred["pred_log1p"] - df_pred["true_log1p"]
+
+df_pred.to_csv("magnet_val_predictions.csv", index=False)
+print("Saved magnet_val_predictions.csv")
+
+# Publication-quality training curve and scatter plots
+import matplotlib.pyplot as plt
+import numpy as np
+
+epochs_axis = np.arange(len(train_hist))*20 + 20
+
+plt.figure()
+plt.plot(epochs_axis, train_hist, label="train")
+plt.plot(epochs_axis, val_hist, label="val")
+plt.xlabel("epoch"); plt.ylabel("SmoothL1 loss"); plt.legend()
+plt.title("MagNet training on January full graph")
+plt.tight_layout()
+plt.savefig("fig_train_loss.png", dpi=250)
+plt.show()
+
+plt.figure()
+plt.plot(epochs_axis, corr_hist)
+plt.xlabel("epoch"); plt.ylabel("val correlation")
+plt.title("Validation correlation over training")
+plt.tight_layout()
+plt.savefig("fig_val_corr.png", dpi=250)
+plt.show()
+
+plt.figure()
+plt.scatter(true, pred, s=6, alpha=0.35)
+plt.xlabel("true log(1+flow)")
+plt.ylabel("pred log(1+flow)")
+plt.title("Validation: predicted vs true flows")
+plt.tight_layout()
+plt.savefig("fig_pred_vs_true.png", dpi=250)
+plt.show()
+
+# Save top error edges and a text summary
+top_under = df_pred.sort_values("error").head(25)
+top_over  = df_pred.sort_values("error", ascending=False).head(25)
+
+top_under.to_csv("top_underpredicted_edges.csv", index=False)
+top_over.to_csv("top_overpredicted_edges.csv", index=False)
+
+print("Saved top_underpredicted_edges.csv + top_overpredicted_edges.csv")
+
+summary = f"""
+MagNet January Full Graph Summary
+--------------------------------
+Nodes: {n}
+Observed directed edges (y>0): {len(y_obs)}
+
+Best/Final validation:
+  corr: {val_corr:.3f}
+  loss: {val_loss:.4f}
+
+Top underpredicted edges saved to: top_underpredicted_edges.csv
+Top overpredicted edges saved to:  top_overpredicted_edges.csv
+
+Figures saved:
+  fig_train_loss.png
+  fig_val_corr.png
+  fig_pred_vs_true.png
+"""
+
+with open("run_summary.txt", "w") as f:
+    f.write(summary)
+
+print(summary)
+
+# -----------------------------------------------------------------------------
+# 4.4 Cross-Month Generalization: Train Jan 2023, Test Feb 2023
+# -----------------------------------------------------------------------------
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load and clean Feb 2023 data with identical pipeline
+dtypes = {
+    "ride_id": "string",
+    "rideable_type": "category",
+    "start_station_name": "string",
+    "start_station_id": "string",
+    "end_station_name": "string",
+    "end_station_id": "string",
+    "start_lat": "float64",
+    "start_lng": "float64",
+    "end_lat": "float64",
+    "end_lng": "float64",
+    "member_casual": "category"
+}
+parse_dates = ["started_at", "ended_at"]
+
+feb_1 = pd.read_csv("/content/202302-citibike-tripdata_1.csv", dtype=dtypes, parse_dates=parse_dates)
+feb_2 = pd.read_csv("/content/202302-citibike-tripdata_2.csv", dtype=dtypes, parse_dates=parse_dates)
+febData = pd.concat([feb_1, feb_2], ignore_index=True)
+
+febData['trip_duration_mins'] = (febData['ended_at'] - febData['started_at']).dt.total_seconds() / 60
+febData = febData[(febData['trip_duration_mins'] >= 1) & (febData['trip_duration_mins'] <= 120)]
+febData = febData.dropna(subset=['start_lat', 'start_lng', 'end_lat', 'end_lng'])
+febData = febData[febData['start_station_id'] != 'Lab - NYC']
+febData = febData[febData['start_station_name'] != febData['end_station_name']]
+print("Feb 2023 trips after cleaning:", len(febData))
+
+# Union of Jan and Feb stations defines the shared node universe
+jan_edges = (
+    janData.groupby(["start_station_name", "end_station_name"])
+           .size().reset_index(name="w_uv")
+           .rename(columns={"start_station_name": "src", "end_station_name": "dst"})
+)
+jan_edges = jan_edges[jan_edges["src"] != jan_edges["dst"]].copy()
+
+feb_edges = (
+    febData.groupby(["start_station_name", "end_station_name"])
+           .size().reset_index(name="w_uv")
+           .rename(columns={"start_station_name": "src", "end_station_name": "dst"})
+)
+feb_edges = feb_edges[feb_edges["src"] != feb_edges["dst"]].copy()
+
+all_stations = pd.unique(pd.concat([jan_edges["src"], jan_edges["dst"],
+                                     feb_edges["src"], feb_edges["dst"]]))
+nodes_cm = list(all_stations)
+n_cm = len(nodes_cm)
+idx_cm = {s: i for i, s in enumerate(nodes_cm)}
+print(f"Union stations: {n_cm}")
+
+# Build January TRAINING graph: adjacency, W, T, Theta, A_mag
+jan_edges["src_i"] = jan_edges["src"].map(idx_cm)
+jan_edges["dst_i"] = jan_edges["dst"].map(idx_cm)
+
+A_jan = np.zeros((n_cm, n_cm), dtype=np.float64)
+for _, r in jan_edges.iterrows():
+    A_jan[int(r["src_i"]), int(r["dst_i"])] = r["w_uv"]
+
+eps = 1e-9
+q = 0.25
+W_jan = 0.5 * (A_jan + A_jan.T)
+T_jan = (A_jan - A_jan.T) / (A_jan + A_jan.T + eps)
+Theta_jan = 2 * np.pi * q * T_jan
+A_mag_jan = W_jan * np.exp(1j * Theta_jan)
+
+# Normalize magnetic edge weights edgewise
+rows_jan, cols_jan = np.nonzero(A_jan > 0)
+d_mag_jan = W_jan.sum(axis=1).astype(np.float64)
+inv_sqrt_jan = 1.0 / np.sqrt(d_mag_jan + 1e-8)
+w_complex_jan = A_mag_jan[rows_jan, cols_jan] * (inv_sqrt_jan[rows_jan] * inv_sqrt_jan[cols_jan])
+ewr_jan = np.real(w_complex_jan).astype(np.float32)
+ewi_jan = np.imag(w_complex_jan).astype(np.float32)
+y_jan = np.log1p(A_jan[rows_jan, cols_jan]).astype(np.float32)
+
+# Build February TEST targets (only edges whose stations appear in Jan node set)
+feb_edges["src_i"] = feb_edges["src"].map(idx_cm)
+feb_edges["dst_i"] = feb_edges["dst"].map(idx_cm)
+feb_edges = feb_edges.dropna(subset=["src_i", "dst_i"])
+feb_edges["src_i"] = feb_edges["src_i"].astype(int)
+feb_edges["dst_i"] = feb_edges["dst_i"].astype(int)
+
+feb_src = feb_edges["src_i"].values.astype(np.int64)
+feb_dst = feb_edges["dst_i"].values.astype(np.int64)
+y_feb = np.log1p(feb_edges["w_uv"].values).astype(np.float32)
+
+# Node features from Jan data (in/out deg/str, lat/lng)
+out_str = np.zeros(n_cm); in_str = np.zeros(n_cm)
+out_deg = np.zeros(n_cm); in_deg = np.zeros(n_cm)
+np.add.at(out_str, jan_edges["src_i"].values, jan_edges["w_uv"].values)
+np.add.at(in_str, jan_edges["dst_i"].values, jan_edges["w_uv"].values)
+
+od = jan_edges.groupby("src_i")["dst_i"].nunique()
+id_ = jan_edges.groupby("dst_i")["src_i"].nunique()
+out_deg[od.index.values] = od.values
+in_deg[id_.index.values] = id_.values
+
+starts = janData[['start_station_name', 'start_lat', 'start_lng']].rename(
+    columns={'start_station_name': 'station', 'start_lat': 'lat', 'start_lng': 'lng'})
+ends = janData[['end_station_name', 'end_lat', 'end_lng']].rename(
+    columns={'end_station_name': 'station', 'end_lat': 'lat', 'end_lng': 'lng'})
+coords_cm = (pd.concat([starts, ends], ignore_index=True)
+               .dropna(subset=['lat', 'lng'])
+               .drop_duplicates(subset=['station'])
+               .set_index('station'))
+
+lat = np.array([coords_cm.loc[s, 'lat'] if s in coords_cm.index else np.nan for s in nodes_cm], dtype=float)
+lng = np.array([coords_cm.loc[s, 'lng'] if s in coords_cm.index else np.nan for s in nodes_cm], dtype=float)
+lat[np.isnan(lat)] = np.nanmean(lat)
+lng[np.isnan(lng)] = np.nanmean(lng)
+
+X_cm = np.column_stack([in_deg, out_deg, in_str, out_str, lat, lng]).astype(np.float32)
+X_cm = (X_cm - X_cm.mean(axis=0, keepdims=True)) / (X_cm.std(axis=0, keepdims=True) + 1e-6)
+
+# Convert to torch tensors
+x_t = torch.tensor(X_cm, dtype=torch.float32, device=device)
+src_t = torch.tensor(rows_jan, dtype=torch.long, device=device)
+dst_t = torch.tensor(cols_jan, dtype=torch.long, device=device)
+ewr_t = torch.tensor(ewr_jan, dtype=torch.float32, device=device)
+ewi_t = torch.tensor(ewi_jan, dtype=torch.float32, device=device)
+y_t = torch.tensor(y_jan, dtype=torch.float32, device=device)
+
+feb_src_t = torch.tensor(feb_src, dtype=torch.long, device=device)
+feb_dst_t = torch.tensor(feb_dst, dtype=torch.long, device=device)
+y_feb_t = torch.tensor(y_feb, dtype=torch.float32, device=device)
+
+# Train on January, evaluate on February at each checkpoint
+E_jan = len(rows_jan)
+torch.manual_seed(0)
+perm = torch.randperm(E_jan, device=device)
+train_E = int(0.8 * E_jan)
+train_idx = perm[:train_E]
+val_idx = perm[train_E:]
+
+model = MagNet(in_dim=x_t.size(1), hidden_dim=64, layers=2, dropout=0.15).to(device)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+loss_fn = nn.SmoothL1Loss(beta=1.0)
+
+train_hist = []; val_hist = []; corr_hist = []; feb_corr_hist = []
+
+for epoch in range(1, 301):
+    model.train()
+    opt.zero_grad()
+    xr, xi = model(x_t, src_t, dst_t, ewr_t, ewi_t)
+    pred = model.predict_edges(xr, xi, src_t[train_idx], dst_t[train_idx])
+    loss = loss_fn(pred, y_t[train_idx])
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+    opt.step()
+
+    if epoch % 20 == 0:
+        model.eval()
+        with torch.no_grad():
+            xr, xi = model(x_t, src_t, dst_t, ewr_t, ewi_t)
+            # Jan validation
+            vp = model.predict_edges(xr, xi, src_t[val_idx], dst_t[val_idx])
+            vl = loss_fn(vp, y_t[val_idx]).item()
+            vc = float(np.corrcoef(vp.cpu().numpy(), y_t[val_idx].cpu().numpy())[0, 1])
+            # Feb test using Jan embeddings
+            fp = model.predict_edges(xr, xi, feb_src_t, feb_dst_t)
+            fl = loss_fn(fp, y_feb_t).item()
+            fc = float(np.corrcoef(fp.cpu().numpy(), y_feb_t.cpu().numpy())[0, 1])
+
+        train_hist.append(loss.item()); val_hist.append(vl)
+        corr_hist.append(vc); feb_corr_hist.append(fc)
+        print(f"Epoch {epoch:03d} | train {loss.item():.4f} | jan_val {vl:.4f} corr {vc:.3f} | feb_test {fl:.4f} corr {fc:.3f}")
+
+# Final cross-month evaluation
+model.eval()
+with torch.no_grad():
+    xr, xi = model(x_t, src_t, dst_t, ewr_t, ewi_t)
+    feb_pred = model.predict_edges(xr, xi, feb_src_t, feb_dst_t).cpu().numpy()
+    feb_true = y_feb_t.cpu().numpy()
+
+final_corr = np.corrcoef(feb_pred, feb_true)[0, 1]
+print(f"\nFinal Feb 2023 test correlation: {final_corr:.3f}")
+
+# Training curves and prediction scatter
+epochs_ax = np.arange(len(corr_hist)) * 20 + 20
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+
+axes[0].plot(epochs_ax, train_hist, label="train")
+axes[0].plot(epochs_ax, val_hist, label="jan val")
+axes[0].set_xlabel("epoch"); axes[0].set_ylabel("SmoothL1 loss")
+axes[0].legend(); axes[0].set_title("Training Loss")
+
+axes[1].plot(epochs_ax, corr_hist, label="jan val", color="blue")
+axes[1].plot(epochs_ax, feb_corr_hist, label="feb test", color="red")
+axes[1].set_xlabel("epoch"); axes[1].set_ylabel("correlation")
+axes[1].legend(); axes[1].set_title("Correlation Over Training")
+
+axes[2].scatter(feb_true, feb_pred, s=4, alpha=0.3)
+axes[2].set_xlabel("true log(1+flow) — Feb 2023")
+axes[2].set_ylabel("pred log(1+flow)")
+axes[2].set_title(f"Feb 2023 Test: pred vs true (r={final_corr:.3f})")
+
+plt.tight_layout()
+plt.savefig("fig_jan_train_feb_test.png", dpi=250)
+plt.show()
+
+# -----------------------------------------------------------------------------
+# 4.5 Cross-Year Generalization: Train Jan 2023, Test Jan 2024
+# -----------------------------------------------------------------------------
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load and clean Jan 2024 with identical pipeline
+dtypes = {
+    "ride_id": "string",
+    "rideable_type": "category",
+    "start_station_name": "string",
+    "start_station_id": "string",
+    "end_station_name": "string",
+    "end_station_id": "string",
+    "start_lat": "float64",
+    "start_lng": "float64",
+    "end_lat": "float64",
+    "end_lng": "float64",
+    "member_casual": "category"
+}
+parse_dates = ["started_at", "ended_at"]
+
+jan24_1 = pd.read_csv("/content/202401-citibike-tripdata_1.csv", dtype=dtypes, parse_dates=parse_dates)
+jan24_2 = pd.read_csv("/content/202401-citibike-tripdata_2.csv", dtype=dtypes, parse_dates=parse_dates)
+jan24Data = pd.concat([jan24_1, jan24_2], ignore_index=True)
+
+jan24Data['trip_duration_mins'] = (jan24Data['ended_at'] - jan24Data['started_at']).dt.total_seconds() / 60
+jan24Data = jan24Data[(jan24Data['trip_duration_mins'] >= 1) & (jan24Data['trip_duration_mins'] <= 120)]
+jan24Data = jan24Data.dropna(subset=['start_lat', 'start_lng', 'end_lat', 'end_lng'])
+jan24Data = jan24Data[jan24Data['start_station_id'] != 'Lab - NYC']
+jan24Data = jan24Data[jan24Data['start_station_name'] != jan24Data['end_station_name']]
+print("Jan 2024 trips after cleaning:", len(jan24Data))
+
+# Edge tables for both years
+jan23_edges = (
+    janData.groupby(["start_station_name", "end_station_name"])
+           .size().reset_index(name="w_uv")
+           .rename(columns={"start_station_name": "src", "end_station_name": "dst"})
+)
+jan23_edges = jan23_edges[jan23_edges["src"] != jan23_edges["dst"]].copy()
+
+jan24_edges = (
+    jan24Data.groupby(["start_station_name", "end_station_name"])
+             .size().reset_index(name="w_uv")
+             .rename(columns={"start_station_name": "src", "end_station_name": "dst"})
+)
+jan24_edges = jan24_edges[jan24_edges["src"] != jan24_edges["dst"]].copy()
+
+# Union of stations across both years (larger than Jan 2023 alone due to expansion)
+all_stations_yr = pd.unique(pd.concat([jan23_edges["src"], jan23_edges["dst"],
+                                        jan24_edges["src"], jan24_edges["dst"]]))
+nodes_yr = list(all_stations_yr)
+n_yr = len(nodes_yr)
+idx_yr = {s: i for i, s in enumerate(nodes_yr)}
+print(f"Union stations (Jan23 + Jan24): {n_yr}")
+
+# January 2023 training graph and magnetic adjacency
+jan23_edges["src_i"] = jan23_edges["src"].map(idx_yr)
+jan23_edges["dst_i"] = jan23_edges["dst"].map(idx_yr)
+
+A_23 = np.zeros((n_yr, n_yr), dtype=np.float64)
+for _, r in jan23_edges.iterrows():
+    A_23[int(r["src_i"]), int(r["dst_i"])] = r["w_uv"]
+
+eps = 1e-9; q = 0.25
+W_23 = 0.5 * (A_23 + A_23.T)
+T_23 = (A_23 - A_23.T) / (A_23 + A_23.T + eps)
+Theta_23 = 2 * np.pi * q * T_23
+A_mag_23 = W_23 * np.exp(1j * Theta_23)
+
+rows_23, cols_23 = np.nonzero(A_23 > 0)
+d_mag_23 = W_23.sum(axis=1).astype(np.float64)
+inv_sqrt_23 = 1.0 / np.sqrt(d_mag_23 + 1e-8)
+w_c_23 = A_mag_23[rows_23, cols_23] * (inv_sqrt_23[rows_23] * inv_sqrt_23[cols_23])
+ewr_23 = np.real(w_c_23).astype(np.float32)
+ewi_23 = np.imag(w_c_23).astype(np.float32)
+y_23 = np.log1p(A_23[rows_23, cols_23]).astype(np.float32)
+
+# Jan 2024 test targets
+jan24_edges["src_i"] = jan24_edges["src"].map(idx_yr)
+jan24_edges["dst_i"] = jan24_edges["dst"].map(idx_yr)
+jan24_edges = jan24_edges.dropna(subset=["src_i", "dst_i"])
+jan24_edges["src_i"] = jan24_edges["src_i"].astype(int)
+jan24_edges["dst_i"] = jan24_edges["dst_i"].astype(int)
+
+test_src_24 = jan24_edges["src_i"].values.astype(np.int64)
+test_dst_24 = jan24_edges["dst_i"].values.astype(np.int64)
+y_24 = np.log1p(jan24_edges["w_uv"].values).astype(np.float32)
+
+# Node features from Jan 2023 only
+out_str = np.zeros(n_yr); in_str = np.zeros(n_yr)
+out_deg = np.zeros(n_yr); in_deg = np.zeros(n_yr)
+np.add.at(out_str, jan23_edges["src_i"].values, jan23_edges["w_uv"].values)
+np.add.at(in_str, jan23_edges["dst_i"].values, jan23_edges["w_uv"].values)
+
+od = jan23_edges.groupby("src_i")["dst_i"].nunique()
+id_ = jan23_edges.groupby("dst_i")["src_i"].nunique()
+out_deg[od.index.values] = od.values
+in_deg[id_.index.values] = id_.values
+
+starts = janData[['start_station_name', 'start_lat', 'start_lng']].rename(
+    columns={'start_station_name': 'station', 'start_lat': 'lat', 'start_lng': 'lng'})
+ends = janData[['end_station_name', 'end_lat', 'end_lng']].rename(
+    columns={'end_station_name': 'station', 'end_lat': 'lat', 'end_lng': 'lng'})
+coords_yr = (pd.concat([starts, ends], ignore_index=True)
+               .dropna(subset=['lat', 'lng'])
+               .drop_duplicates(subset=['station'])
+               .set_index('station'))
+
+lat = np.array([coords_yr.loc[s, 'lat'] if s in coords_yr.index else np.nan for s in nodes_yr], dtype=float)
+lng = np.array([coords_yr.loc[s, 'lng'] if s in coords_yr.index else np.nan for s in nodes_yr], dtype=float)
+lat[np.isnan(lat)] = np.nanmean(lat)
+lng[np.isnan(lng)] = np.nanmean(lng)
+
+X_yr = np.column_stack([in_deg, out_deg, in_str, out_str, lat, lng]).astype(np.float32)
+X_yr = (X_yr - X_yr.mean(axis=0, keepdims=True)) / (X_yr.std(axis=0, keepdims=True) + 1e-6)
+
+# Tensors
+x_t = torch.tensor(X_yr, dtype=torch.float32, device=device)
+src_t = torch.tensor(rows_23, dtype=torch.long, device=device)
+dst_t = torch.tensor(cols_23, dtype=torch.long, device=device)
+ewr_t = torch.tensor(ewr_23, dtype=torch.float32, device=device)
+ewi_t = torch.tensor(ewi_23, dtype=torch.float32, device=device)
+y_t = torch.tensor(y_23, dtype=torch.float32, device=device)
+
+t24_src_t = torch.tensor(test_src_24, dtype=torch.long, device=device)
+t24_dst_t = torch.tensor(test_dst_24, dtype=torch.long, device=device)
+y_24_t = torch.tensor(y_24, dtype=torch.float32, device=device)
+
+# Train Jan 2023, track Jan 2024 correlation at each checkpoint
+E_23 = len(rows_23)
+torch.manual_seed(0)
+perm = torch.randperm(E_23, device=device)
+train_E = int(0.8 * E_23)
+train_idx = perm[:train_E]
+val_idx = perm[train_E:]
+
+model = MagNet(in_dim=x_t.size(1), hidden_dim=64, layers=2, dropout=0.15).to(device)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+loss_fn = nn.SmoothL1Loss(beta=1.0)
+
+train_hist = []; val_hist = []; corr_hist = []; jan24_corr_hist = []
+
+for epoch in range(1, 301):
+    model.train()
+    opt.zero_grad()
+    xr, xi = model(x_t, src_t, dst_t, ewr_t, ewi_t)
+    pred = model.predict_edges(xr, xi, src_t[train_idx], dst_t[train_idx])
+    loss = loss_fn(pred, y_t[train_idx])
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+    opt.step()
+
+    if epoch % 20 == 0:
+        model.eval()
+        with torch.no_grad():
+            xr, xi = model(x_t, src_t, dst_t, ewr_t, ewi_t)
+            # Jan 2023 validation
+            vp = model.predict_edges(xr, xi, src_t[val_idx], dst_t[val_idx])
+            vl = loss_fn(vp, y_t[val_idx]).item()
+            vc = float(np.corrcoef(vp.cpu().numpy(), y_t[val_idx].cpu().numpy())[0, 1])
+            # Jan 2024 test
+            tp = model.predict_edges(xr, xi, t24_src_t, t24_dst_t)
+            tl = loss_fn(tp, y_24_t).item()
+            tc = float(np.corrcoef(tp.cpu().numpy(), y_24_t.cpu().numpy())[0, 1])
+
+        train_hist.append(loss.item()); val_hist.append(vl)
+        corr_hist.append(vc); jan24_corr_hist.append(tc)
+        print(f"Epoch {epoch:03d} | train {loss.item():.4f} | jan23_val {vl:.4f} corr {vc:.3f} | jan24_test {tl:.4f} corr {tc:.3f}")
+
+# Final cross-year evaluation
+model.eval()
+with torch.no_grad():
+    xr, xi = model(x_t, src_t, dst_t, ewr_t, ewi_t)
+    jan24_pred = model.predict_edges(xr, xi, t24_src_t, t24_dst_t).cpu().numpy()
+    jan24_true = y_24_t.cpu().numpy()
+
+final_corr_24 = np.corrcoef(jan24_pred, jan24_true)[0, 1]
+print(f"\nFinal Jan 2024 test correlation: {final_corr_24:.3f}")
+
+# Count novel stations that didn't appear in Jan 2023
+jan23_station_set = set(jan23_edges["src"].tolist() + jan23_edges["dst"].tolist())
+jan24_new_src = jan24_edges[~jan24_edges["src"].isin(jan23_station_set)]
+jan24_new_dst = jan24_edges[~jan24_edges["dst"].isin(jan23_station_set)]
+print(f"Jan24 edges with novel source station: {len(jan24_new_src)}")
+print(f"Jan24 edges with novel dest station: {len(jan24_new_dst)}")
+
+# Plots
+epochs_ax = np.arange(len(corr_hist)) * 20 + 20
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+
+axes[0].plot(epochs_ax, train_hist, label="train")
+axes[0].plot(epochs_ax, val_hist, label="jan23 val")
+axes[0].set_xlabel("epoch"); axes[0].set_ylabel("SmoothL1 loss")
+axes[0].legend(); axes[0].set_title("Training Loss (Jan 2023)")
+
+axes[1].plot(epochs_ax, corr_hist, label="jan23 val", color="blue")
+axes[1].plot(epochs_ax, jan24_corr_hist, label="jan24 test", color="red")
+axes[1].set_xlabel("epoch"); axes[1].set_ylabel("correlation")
+axes[1].legend(); axes[1].set_title("Correlation: Same-Month vs Cross-Year")
+
+axes[2].scatter(jan24_true, jan24_pred, s=4, alpha=0.3)
+axes[2].set_xlabel("true log(1+flow) — Jan 2024")
+axes[2].set_ylabel("pred log(1+flow)")
+axes[2].set_title(f"Jan 2024 Test: pred vs true (r={final_corr_24:.3f})")
+
+plt.tight_layout()
+plt.savefig("fig_jan23_train_jan24_test.png", dpi=250)
+plt.show()
+
+# Summary
+summary = f"""
+Cross-Year Generalization Summary
+----------------------------------
+Train: Jan 2023 ({len(jan23_edges)} directed edges, {len(set(jan23_edges['src']) | set(jan23_edges['dst']))} stations)
+Test:  Jan 2024 ({len(jan24_edges)} directed edges, {len(set(jan24_edges['src']) | set(jan24_edges['dst']))} stations)
+Union: {n_yr} stations
+
+Jan 2023 val correlation:  {corr_hist[-1]:.3f}
+Jan 2024 test correlation: {final_corr_24:.3f}
+
+Novel stations in Jan24: src={len(jan24_new_src)}, dst={len(jan24_new_dst)}
+"""
+print(summary)
