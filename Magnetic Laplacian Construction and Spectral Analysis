@@ -1,1 +1,284 @@
-A
+# =============================================================================
+# SECTION 3: MAGNETIC LAPLACIAN CONSTRUCTION AND SPECTRAL ANALYSIS
+# =============================================================================
+# Build the magnetic Laplacian on the thresholded subgraph (edges > 100 trips),
+# compute its eigendecomposition, analyze eigengaps, and perform spectral
+# clustering to reveal directional flow communities.
+# =============================================================================
+
+# Build weighted directed adjacency matrix from the thresholded subgraph G
+nodes = list(G.nodes())
+n = len(nodes)
+idx = {node: i for i, node in enumerate(nodes)}
+
+A = np.zeros((n, n), dtype=float)
+for u, v, d in G.edges(data=True):
+    i, j = idx[u], idx[v]
+    A[i, j] = d.get('weight', 1.0)
+
+# Directed combinatorial Laplacian baseline (non-symmetric)
+d_out = A.sum(axis=1)
+D = np.diag(d_out)
+L = D - A
+
+# Decompose A into symmetric magnitude and skew-symmetric orientation parts
+W_s = 0.5 * (A + A.T)                    # undirected interaction strength
+eps = 1e-9
+T = (A - A.T) / (A + A.T + eps)          # normalized asymmetry in [-1, 1]
+
+# Magnetic phase with charge q=0.25 (literature default)
+q = 0.25
+Theta = 2 * np.pi * q * T                # phase angles in radians
+
+# Magnetic adjacency: magnitude x complex phase (Hermitian)
+A_mag = W_s * np.exp(1j * Theta)
+
+# Magnetic Laplacian L = D - A (uses symmetric magnitudes for degrees)
+d_mag = W_s.sum(axis=1)
+D_mag = np.diag(d_mag)
+L_mag = D_mag - A_mag
+
+# Sanity check: Hermitian error should be near zero
+herm_err = np.linalg.norm(L_mag - L_mag.conj().T)
+print("Hermitian error ||L - L*||:", herm_err)
+print("Any NaNs?", np.isnan(L_mag).any())
+
+# Dense eigendecomposition (OK for n ~ 311)
+evals, evecs = np.linalg.eigh(L_mag)     # sorted ascending
+evals = np.real(evals)                   # should already be real
+
+# Find the largest eigengap within the first ~50 eigenvalues
+gaps = np.diff(evals)
+k_star = int(np.argmax(gaps[:min(50, len(gaps))]) + 1)
+
+print("Top eigengap index k* =", k_star)
+print("eigvals around gap:", evals[k_star-2:k_star+3])
+print("gap size:", gaps[k_star-1])
+
+# Plot first 60 eigenvalues and their gaps
+m = min(60, len(evals))
+plt.figure(figsize=(7,4))
+plt.plot(range(m), evals[:m], marker='o', linewidth=1)
+plt.title("First eigenvalues of magnetic Laplacian")
+plt.xlabel("k")
+plt.ylabel("lambda_k")
+plt.show()
+
+plt.figure(figsize=(7,4))
+plt.plot(range(m-1), gaps[:m-1], marker='o', linewidth=1)
+plt.title("Eigengaps (lambda_{k+1} - lambda_k)")
+plt.xlabel("k")
+plt.ylabel("gap")
+plt.show()
+
+# ---------- Spectral clustering from magnetic Laplacian eigenvectors ----------
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+
+# Recompute eigendecomposition and pick k from largest eigengap
+evals, evecs = np.linalg.eigh(L_mag)
+evals = np.real(evals)
+gaps = np.diff(evals)
+
+M = min(50, len(gaps))
+k = int(np.argmax(gaps[:M]) + 1)
+print("Chosen k (from eigengap) =", k, " gap =", gaps[k-1])
+
+# Spectral embedding: take first k eigenvectors (optionally skip the trivial one)
+skip_first = True
+start = 1 if skip_first else 0
+k_use = k
+
+X = evecs[:, start:start+k_use]
+X_feat = np.real(X)                      # cluster on real parts
+
+# Row-normalize to help k-means
+X_norm = X_feat / (np.linalg.norm(X_feat, axis=1, keepdims=True) + 1e-12)
+
+# k-means on spectral embedding
+try:
+    from sklearn.cluster import KMeans
+    labels = KMeans(n_clusters=k, n_init=30, random_state=0).fit_predict(X_norm)
+except Exception as e:
+    raise RuntimeError("scikit-learn is required for KMeans here. Install sklearn or ask for NumPy k-means.") from e
+
+eig_df = pd.DataFrame({"station": nodes, "cluster": labels})
+print("\nCluster sizes:")
+print(eig_df["cluster"].value_counts().sort_values(ascending=False))
+
+# Merge cluster labels with geographic coordinates for plotting
+plot_df = (eig_df.merge(coords[["station","lat","lng"]], on="station", how="left")
+                 .dropna(subset=["lat","lng"]))
+
+# Web Mercator conversion for map overlay
+R = 6378137.0
+def mercator_xy(lon, lat):
+    lon = np.asarray(lon, dtype=float)
+    lat = np.asarray(lat, dtype=float)
+    x = R * np.deg2rad(lon)
+    y = R * np.log(np.tan(np.pi/4.0 + np.deg2rad(lat)/2.0))
+    return x, y
+
+plot_df["x"], plot_df["y"] = mercator_xy(plot_df["lng"].values, plot_df["lat"].values)
+
+# Basemap extent (must match nycmap.png)
+bbox = (-74.30, -73.50, 40.40, 41.10)
+xmin, ymin = mercator_xy(bbox[0], bbox[2])
+xmax, ymax = mercator_xy(bbox[1], bbox[3])
+
+img = mpimg.imread("nycmap.png")
+
+plt.figure(figsize=(8,10))
+plt.imshow(img, extent=[xmin, xmax, ymin, ymax], origin="upper", alpha=0.55)
+
+sc = plt.scatter(
+    plot_df["x"], plot_df["y"],
+    c=plot_df["cluster"],
+    cmap="tab20",
+    s=18,
+    alpha=0.90,
+    linewidths=0
+)
+
+plt.xlim(xmin, xmax)
+plt.ylim(ymin, ymax)
+plt.gca().set_aspect("equal", adjustable="box")
+plt.title(f"Spectral Clusters from Magnetic Laplacian (k={k}, skip_first={skip_first})")
+plt.xlabel("Web Mercator X")
+plt.ylabel("Web Mercator Y")
+plt.colorbar(sc, label="Cluster ID")
+plt.show()
+
+# ---------- Spectral clustering evaluation (silhouette and modularity) ----------
+
+import networkx as nx
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+
+# Rebuild the thresholded subgraph for clustering evaluation
+edge_weights_thresh = (
+    janData.groupby(['start_station_name', 'end_station_name'])
+           .size().reset_index(name='weight')
+)
+G_thresh = nx.DiGraph()
+for _, r in edge_weights_thresh.iterrows():
+    if r['weight'] > 100:
+        G_thresh.add_edge(r['start_station_name'], r['end_station_name'], weight=r['weight'])
+G_thresh.remove_edges_from(nx.selfloop_edges(G_thresh))
+
+nodes_th = list(G_thresh.nodes())
+n_th = len(nodes_th)
+idx_th = {node: i for i, node in enumerate(nodes_th)}
+
+A_th = np.zeros((n_th, n_th), dtype=float)
+for u, v, d in G_thresh.edges(data=True):
+    A_th[idx_th[u], idx_th[v]] = d.get('weight', 1.0)
+
+W_th = 0.5 * (A_th + A_th.T)
+T_th = (A_th - A_th.T) / (A_th + A_th.T + 1e-9)
+
+# Geographic coordinates used as ground truth reference for silhouette
+coords_th = coords.set_index('station') if 'station' in coords.columns else coords.copy()
+lat_th = np.array([coords_th.loc[s,'lat'] if s in coords_th.index else np.nan for s in nodes_th], dtype=float)
+lng_th = np.array([coords_th.loc[s,'lng'] if s in coords_th.index else np.nan for s in nodes_th], dtype=float)
+lat_th[np.isnan(lat_th)] = np.nanmean(lat_th)
+lng_th[np.isnan(lng_th)] = np.nanmean(lng_th)
+geo_coords = np.column_stack([lat_th, lng_th])
+
+# Magnetic Laplacian at q=0.25
+q_val = 0.25
+Theta_th = 2 * np.pi * q_val * T_th
+A_mag_th = W_th * np.exp(1j * Theta_th)
+d_mag_th = W_th.sum(axis=1)
+D_mag_th = np.diag(d_mag_th)
+L_mag_th = D_mag_th - A_mag_th
+
+evals_th, evecs_th = np.linalg.eigh(L_mag_th)
+evals_th = np.real(evals_th)
+
+# Symmetric Laplacian (q=0) for comparison
+L_sym_th = np.diag(W_th.sum(axis=1)) - W_th
+evals_sym, evecs_sym = np.linalg.eigh(L_sym_th)
+evals_sym = np.real(evals_sym)
+
+# Sweep k and compute silhouette for magnetic vs symmetric vs geographic clusterings
+k_range = range(2, 30)
+sil_magnetic = []
+sil_symmetric = []
+sil_geographic = []
+
+for k_test in k_range:
+    # Magnetic spectral clustering
+    X_spec = np.real(evecs_th[:, 1:k_test+1])
+    X_spec_norm = X_spec / (np.linalg.norm(X_spec, axis=1, keepdims=True) + 1e-12)
+    labels_mag = KMeans(n_clusters=k_test, n_init=10, random_state=0).fit_predict(X_spec_norm)
+    sil_magnetic.append(silhouette_score(geo_coords, labels_mag))
+
+    # Symmetric spectral clustering
+    X_sym_spec = evecs_sym[:, 1:k_test+1]
+    X_sym_norm = X_sym_spec / (np.linalg.norm(X_sym_spec, axis=1, keepdims=True) + 1e-12)
+    labels_sym = KMeans(n_clusters=k_test, n_init=10, random_state=0).fit_predict(X_sym_norm)
+    sil_symmetric.append(silhouette_score(geo_coords, labels_sym))
+
+    # Pure geographic k-means baseline
+    labels_geo = KMeans(n_clusters=k_test, n_init=10, random_state=0).fit_predict(geo_coords)
+    sil_geographic.append(silhouette_score(geo_coords, labels_geo))
+
+plt.figure(figsize=(8, 5))
+plt.plot(list(k_range), sil_magnetic, 'o-', color='#e74c3c', label='Magnetic Spectral (q=0.25)', linewidth=2)
+plt.plot(list(k_range), sil_symmetric, 's-', color='#2ecc71', label='Symmetric Spectral (q=0)', linewidth=2)
+plt.plot(list(k_range), sil_geographic, '^-', color='#3498db', label='Geographic K-Means', linewidth=2)
+plt.xlabel("Number of Clusters (k)")
+plt.ylabel("Silhouette Score (geographic coordinates)")
+plt.title("Clustering Quality: Magnetic vs Symmetric Spectral vs Geographic K-Means")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig("fig_spectral_silhouette.png", dpi=250)
+plt.show()
+print("Saved fig_spectral_silhouette.png")
+
+# Modularity comparison on undirected projection
+G_undirected = G_thresh.to_undirected()
+
+mod_magnetic = []
+mod_symmetric = []
+mod_geographic = []
+
+for k_test in k_range:
+    # Magnetic spectral modularity
+    X_spec = np.real(evecs_th[:, 1:k_test+1])
+    X_spec_norm = X_spec / (np.linalg.norm(X_spec, axis=1, keepdims=True) + 1e-12)
+    labels_m = KMeans(n_clusters=k_test, n_init=10, random_state=0).fit_predict(X_spec_norm)
+    communities_m = [set(np.where(labels_m == c)[0]) for c in range(k_test)]
+    communities_m_names = [set(nodes_th[i] for i in comm) for comm in communities_m]
+    mod_magnetic.append(nx.community.modularity(G_undirected, communities_m_names))
+
+    # Symmetric spectral modularity
+    X_sym_spec = evecs_sym[:, 1:k_test+1]
+    X_sym_norm = X_sym_spec / (np.linalg.norm(X_sym_spec, axis=1, keepdims=True) + 1e-12)
+    labels_s = KMeans(n_clusters=k_test, n_init=10, random_state=0).fit_predict(X_sym_norm)
+    communities_s_names = [set(nodes_th[i] for i in np.where(labels_s == c)[0]) for c in range(k_test)]
+    mod_symmetric.append(nx.community.modularity(G_undirected, communities_s_names))
+
+    # Geographic modularity baseline
+    labels_g = KMeans(n_clusters=k_test, n_init=10, random_state=0).fit_predict(geo_coords)
+    communities_g_names = [set(nodes_th[i] for i in np.where(labels_g == c)[0]) for c in range(k_test)]
+    mod_geographic.append(nx.community.modularity(G_undirected, communities_g_names))
+
+plt.figure(figsize=(8, 5))
+plt.plot(list(k_range), mod_magnetic, 'o-', color='#e74c3c', label='Magnetic Spectral (q=0.25)', linewidth=2)
+plt.plot(list(k_range), mod_symmetric, 's-', color='#2ecc71', label='Symmetric Spectral (q=0)', linewidth=2)
+plt.plot(list(k_range), mod_geographic, '^-', color='#3498db', label='Geographic K-Means', linewidth=2)
+plt.xlabel("Number of Clusters (k)")
+plt.ylabel("Modularity")
+plt.title("Graph Modularity: Magnetic vs Symmetric Spectral vs Geographic K-Means")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig("fig_spectral_modularity.png", dpi=250)
+plt.show()
+print("Saved fig_spectral_modularity.png")
