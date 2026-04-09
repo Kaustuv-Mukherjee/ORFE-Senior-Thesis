@@ -7,256 +7,13 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# 4.1 Build node feature matrix
-# -----------------------------------------------------------------------------
-
-# Structural features pulled from the metrics DataFrame
-metrics = metrics.set_index("node")
-
-in_deg  = metrics["in_deg"].values
-out_deg = metrics["out_deg"].values
-in_str  = metrics["in_str"].values
-out_str = metrics["out_str"].values
-pagerank = metrics["pagerank"].values
-betweenness = metrics["betweenness"].values
-clustering = metrics["clustering"].values
-
-# Geographic features
-coords_df = coords.set_index("station")
-lat = np.array([coords_df.loc[s, 'lat'] if s in coords_df.index else np.nan for s in nodes])
-lng = np.array([coords_df.loc[s, 'lng'] if s in coords_df.index else np.nan for s in nodes])
-
-lat[np.isnan(lat)] = np.nanmean(lat)
-lng[np.isnan(lng)] = np.nanmean(lng)
-
-X = np.column_stack([
-    in_deg,
-    out_deg,
-    in_str,
-    out_str,
-    pagerank,
-    betweenness,
-    clustering,
-    lat,
-    lng
-]).astype(np.float32)
-
-# Z-score standardization
-X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-6)
-
-print("Feature matrix shape:", X.shape)
-
-# Convert adjacency to edge list with complex edge weights
-rows, cols = np.nonzero(A > 0)
-E = len(rows)
-
-w_complex = A_mag[rows, cols]
-ew_r = np.real(w_complex).astype(np.float32)
-ew_i = np.imag(w_complex).astype(np.float32)
-
-y = np.log1p(A[rows, cols]).astype(np.float32)
-
-print("Edges:", E)
-
-# -----------------------------------------------------------------------------
-# 4.2 Magnetic normalization, MagNet architecture, and subgraph training
-# -----------------------------------------------------------------------------
-
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-# Rebuild X from already-indexed metrics DataFrame (prevents KeyError on re-run)
-metrics_ = metrics
-
-in_deg  = metrics_["in_deg"].values
-out_deg = metrics_["out_deg"].values
-in_str  = metrics_["in_str"].values
-out_str = metrics_["out_str"].values
-pagerank = metrics_["pagerank"].values
-betweenness = metrics_["betweenness"].values
-clustering = metrics_["clustering"].values
-
-coords_ = coords.set_index("station")
-lat = np.array([coords_.loc[s, 'lat'] if s in coords_.index else np.nan for s in nodes], dtype=float)
-lng = np.array([coords_.loc[s, 'lng'] if s in coords_.index else np.nan for s in nodes], dtype=float)
-lat[np.isnan(lat)] = np.nanmean(lat)
-lng[np.isnan(lng)] = np.nanmean(lng)
-
-X = np.column_stack([
-    in_deg, out_deg, in_str, out_str, pagerank, betweenness, clustering, lat, lng
-]).astype(np.float32)
-
-X = (X - X.mean(axis=0, keepdims=True)) / (X.std(axis=0, keepdims=True) + 1e-6)
-print("X shape:", X.shape)
-
-# Build normalized magnetic edge weights D^{-1/2} A_mag D^{-1/2} edgewise
-rows, cols = np.nonzero(A > 0)
-E = len(rows)
-print("Edges:", E)
-
-d_mag = W_s.sum(axis=1).astype(np.float64)
-inv_sqrt = 1.0 / np.sqrt(d_mag + 1e-8)
-
-w_complex = A_mag[rows, cols] * (inv_sqrt[rows] * inv_sqrt[cols])
-
-ew_r = np.real(w_complex).astype(np.float32)
-ew_i = np.imag(w_complex).astype(np.float32)
-
-# Target: log(weight); threshold > 100 gives better spread than log1p
-y = np.log(A[rows, cols]).astype(np.float32)
-
-# Move everything to GPU/CPU tensors
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-x_t = torch.tensor(X, dtype=torch.float32, device=device)
-
-src = torch.tensor(rows, dtype=torch.long, device=device)
-dst = torch.tensor(cols, dtype=torch.long, device=device)
-
-ewr = torch.tensor(ew_r, dtype=torch.float32, device=device)
-ewi = torch.tensor(ew_i, dtype=torch.float32, device=device)
-
-y_t = torch.tensor(y, dtype=torch.float32, device=device)
-
-# -----------------------------
-# MagNet layer: complex linear transformation + complex edge aggregation
-# -----------------------------
-class MagNetLayer(nn.Module):
-    def __init__(self, in_dim, out_dim):
-        super().__init__()
-        self.Wr = nn.Linear(in_dim, out_dim, bias=False)
-        self.Wi = nn.Linear(in_dim, out_dim, bias=False)
-        self.br = nn.Parameter(torch.zeros(out_dim))
-        self.bi = nn.Parameter(torch.zeros(out_dim))
-
-    def forward(self, xr, xi, src, dst, ewr, ewi, n_nodes):
-        # complex linear: (Wr + iWi)(xr + ixi)
-        zr = self.Wr(xr) - self.Wi(xi)
-        zi = self.Wr(xi) + self.Wi(xr)
-
-        # gather source embeddings
-        zr_u = zr[src]
-        zi_u = zi[src]
-
-        # complex edge-weight multiply
-        mr = ewr[:, None] * zr_u - ewi[:, None] * zi_u
-        mi = ewr[:, None] * zi_u + ewi[:, None] * zr_u
-
-        # scatter aggregate into destinations
-        out_r = torch.zeros((n_nodes, zr.size(1)), device=zr.device)
-        out_i = torch.zeros((n_nodes, zi.size(1)), device=zi.device)
-        out_r.index_add_(0, dst, mr)
-        out_i.index_add_(0, dst, mi)
-
-        out_r = out_r + self.br
-        out_i = out_i + self.bi
-        return out_r, out_i
-
-# -----------------------------
-# MagNet model: stacked layers + MLP edge readout
-# -----------------------------
-class MagNet(nn.Module):
-    def __init__(self, in_dim, hidden_dim=64, layers=2, dropout=0.1):
-        super().__init__()
-        self.layers = nn.ModuleList()
-        self.layers.append(MagNetLayer(in_dim, hidden_dim))
-        for _ in range(layers - 1):
-            self.layers.append(MagNetLayer(hidden_dim, hidden_dim))
-        self.dropout = dropout
-
-        # Edge prediction head: concat [src_real, src_imag, dst_real, dst_imag]
-        self.edge_mlp = nn.Sequential(
-            nn.Linear(4 * hidden_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, 1)
-        )
-
-    def forward(self, x, src, dst, ewr, ewi):
-        n = x.size(0)
-        xr = x                              # real channel = input features
-        xi = torch.zeros_like(x)            # imaginary channel = zeros initially
-
-        for layer in self.layers:
-            xr, xi = layer(xr, xi, src, dst, ewr, ewi, n)
-            xr = F.relu(xr)
-            xi = F.relu(xi)
-            xr = F.dropout(xr, p=self.dropout, training=self.training)
-            xi = F.dropout(xi, p=self.dropout, training=self.training)
-
-        return xr, xi
-
-    def predict_edges(self, xr, xi, src_e, dst_e):
-        ur = xr[src_e]; ui = xi[src_e]
-        vr = xr[dst_e]; vi = xi[dst_e]
-        feat = torch.cat([ur, ui, vr, vi], dim=1)
-        return self.edge_mlp(feat).squeeze(-1)
-
-# -----------------------------
-# Train MagNet on subgraph with Huber loss + gradient clipping
-# -----------------------------
-torch.manual_seed(0)
-
-perm = torch.randperm(E, device=device)
-train_E = int(0.8 * E)
-train_idx = perm[:train_E]
-val_idx   = perm[train_E:]
-
-model = MagNet(in_dim=x_t.size(1), hidden_dim=64, layers=2, dropout=0.15).to(device)
-opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-
-loss_fn = nn.SmoothL1Loss(beta=1.0)
-
-def eval_metrics(idx):
-    model.eval()
-    with torch.no_grad():
-        xr, xi = model(x_t, src, dst, ewr, ewi)
-        pred = model.predict_edges(xr, xi, src[idx], dst[idx])
-        loss = loss_fn(pred, y_t[idx]).item()
-
-        pred_np = pred.detach().cpu().numpy()
-        true_np = y_t[idx].detach().cpu().numpy()
-        corr = np.corrcoef(pred_np, true_np)[0, 1]
-        return loss, corr, (pred_np.min(), pred_np.max()), (true_np.min(), true_np.max())
-
-for epoch in range(1, 301):
-    model.train()
-    opt.zero_grad()
-
-    xr, xi = model(x_t, src, dst, ewr, ewi)
-    pred = model.predict_edges(xr, xi, src[train_idx], dst[train_idx])
-    loss = loss_fn(pred, y_t[train_idx])
-
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
-    opt.step()
-
-    if epoch % 25 == 0:
-        val_loss, val_corr, pr_rng, yt_rng = eval_metrics(val_idx)
-        print(f"Epoch {epoch:03d} | Train {loss.item():.4f} | Val {val_loss:.4f} | Val corr {val_corr:.3f}")
-        print(f"   pred range {pr_rng} | true range {yt_rng}")
-
-# Final subgraph evaluation
-model.eval()
-with torch.no_grad():
-    xr, xi = model(x_t, src, dst, ewr, ewi)
-    val_pred = model.predict_edges(xr, xi, src[val_idx], dst[val_idx]).detach().cpu().numpy()
-    val_true = y_t[val_idx].detach().cpu().numpy()
-
-corr = np.corrcoef(val_pred, val_true)[0,1]
-print("Val correlation:", corr)
-print("Val pred range:", val_pred.min(), val_pred.max())
-print("Val true range:", val_true.min(), val_true.max())
-
-# -----------------------------------------------------------------------------
-# 4.3 Full-graph MagNet training (January 2023, all 1760 stations)
+# 4.1 Full-graph MagNet training (January 2023, all 1760 stations)
 # -----------------------------------------------------------------------------
 
 import numpy as np
 import pandas as pd
 
-# Rebuild directed edge table from raw trips (no threshold)
+# Build directed edge table from raw trips
 edges = (
     janData.groupby(["start_station_name", "end_station_name"])
            .size()
@@ -606,7 +363,7 @@ with open("run_summary.txt", "w") as f:
 print(summary)
 
 # -----------------------------------------------------------------------------
-# 4.4 Cross-Month Generalization: Train Jan 2023, Test Feb 2023
+# 4.2 Cross-Month Generalization: Train Jan 2023, Test Feb 2023
 # -----------------------------------------------------------------------------
 
 import numpy as np
@@ -817,7 +574,7 @@ plt.savefig("fig_jan_train_feb_test.png", dpi=250)
 plt.show()
 
 # -----------------------------------------------------------------------------
-# 4.5 Cross-Year Generalization: Train Jan 2023, Test Jan 2024
+# 4.3 Cross-Year Generalization: Train Jan 2023, Test Jan 2024
 # -----------------------------------------------------------------------------
 
 import numpy as np
