@@ -7,7 +7,7 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# 4.1 Build node feature matrix on the subgraph (first pass)
+# 4.1 Build node feature matrix
 # -----------------------------------------------------------------------------
 
 # Structural features pulled from the metrics DataFrame
