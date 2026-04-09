@@ -1,1 +1,418 @@
-A
+# =============================================================================
+# SECTION 1: PRE-PROCESSING AND VISUALIZATION
+# =============================================================================
+# Load January 2023 CitiBike data, clean it, and produce exploratory visuals
+# (hourly ridership, station maps, directed graph overlays, EDA diagrams).
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.image as mpimg
+
+# Explicit dtypes for memory efficiency and column uniformity
+dtypes = {
+    "ride_id": "string",
+    "rideable_type": "category",
+    "start_station_name": "string",
+    "start_station_id": "string",
+    "end_station_name": "string",
+    "end_station_id": "string",
+    "start_lat": "float64",
+    "start_lng": "float64",
+    "end_lat": "float64",
+    "end_lng": "float64",
+    "member_casual": "category"
+}
+parse_dates = ["started_at", "ended_at"]
+
+# Load and merge the two January 2023 CSV halves
+x = pd.read_csv("/content/202301-citibike-tripdata_1.csv",dtype=dtypes,parse_dates=parse_dates)
+y = pd.read_csv("/content/202301-citibike-tripdata_2.csv",dtype=dtypes,parse_dates=parse_dates)
+janData = pd.concat([x,y], ignore_index=True)
+
+print("Shape: ", janData.shape)
+print("Columns: ", janData.columns.tolist())
+
+janData.head()
+
+# Compute trip duration in minutes
+janData['trip_duration_mins'] = (janData['ended_at'] - janData['started_at']).dt.total_seconds()/60
+
+print("Shape: ", janData.shape)
+
+# Filter out unrealistic trips (< 1 min or > 2 hours) and drop missing coordinates
+print("Number of Datapoints: ", janData.shape[0])
+janData = janData[(janData['trip_duration_mins'] >= 1)]
+print("Number of Datapoints: ", janData.shape[0])
+janData = janData[(janData['trip_duration_mins'] <= 120)]
+print("Number of Datapoints: ", janData.shape[0])
+
+janData = janData.dropna(subset=['start_lat', 'start_lng', 'end_lat', 'end_lng'])
+print("Number of Datapoints: ", janData.shape[0])
+
+# Remove the "Lab - NYC" test station
+janData = janData[janData['start_station_id'] != 'Lab - NYC']
+print("Number of Datapoints: ", janData.shape[0])
+
+# Normalize station IDs to a consistent decimal format
+def normalize_station_id(x):
+    # Try to interpret as a float if possible
+    try:
+        num = float(x)
+        return f"{num:.2f}"
+    except ValueError:
+        # If it's alphanumeric, just return as-is (strip whitespace)
+        return str(x)
+
+janData['start_station_id'] = janData['start_station_id'].apply(normalize_station_id)
+janData['end_station_id']   = janData['end_station_id'].apply(normalize_station_id)
+
+janData.head()
+
+print(janData['rideable_type'].value_counts())
+print(janData['member_casual'].value_counts())
+
+# Hourly trip distribution to see commuter peaks
+hourCounts = janData["started_at"].dt.hour.value_counts().sort_index()
+
+import matplotlib.pyplot as plt
+
+hourCounts.plot(kind='bar', figsize=(10,4))
+plt.title("CitiBike Trips by Hour of Day – Januaruy 2023")
+plt.xlabel("Hour of Day")
+plt.ylabel("Number of Trips Started")
+plt.show()
+
+# Basic dataset statistics
+print("Total trip count after pruning:", len(janData))
+print("Unique start stations:", janData['start_station_name'].nunique())
+print("Unique end stations:", janData['end_station_name'].nunique())
+print()
+print("Top 10 busiest start stations: ")
+print(janData['start_station_name'].value_counts().head(10))
+print()
+print("Top 10 least busy start stations: ")
+print(janData['start_station_name'].value_counts().tail(10))
+
+import networkx as nx
+import matplotlib.pyplot as plt
+
+# Quick first-pass directed graph visualization (edges > 50 trips)
+edge_weights = (
+    janData.groupby(['start_station_name', 'end_station_name'])
+      .size()
+      .reset_index(name='weight')
+)
+
+G = nx.DiGraph()
+for _, row in edge_weights.iterrows():
+    if row['weight'] > 50:  # threshold for clarity
+        G.add_edge(row['start_station_name'], row['end_station_name'], weight=row['weight'])
+
+plt.figure(figsize=(10,10))
+pos = nx.spring_layout(G, k=0.15, iterations=20)
+nx.draw_networkx_nodes(G, pos, node_size=10)
+nx.draw_networkx_edges(G, pos, alpha=0.1, arrows=False)
+plt.title("CitiBike Directed Graph – Jan 2023 (edges > 50 trips)")
+plt.axis('off')
+plt.show()
+
+import matplotlib.pyplot as plt
+import networkx as nx
+
+# Build directed graph with higher threshold (edges > 100) for clearer visualization
+edge_weights = (
+    janData.groupby(['start_station_name', 'end_station_name'])
+           .size()
+           .reset_index(name='weight')
+)
+
+G = nx.DiGraph()
+for _, r in edge_weights.iterrows():
+    if r['weight'] > 100:
+        G.add_edge(r['start_station_name'], r['end_station_name'], weight=r['weight'])
+
+# Position nodes by actual lat/lng
+station_coords = (
+    janData[['start_station_name', 'start_lat', 'start_lng']]
+    .drop_duplicates('start_station_name')
+    .set_index('start_station_name')[['start_lng', 'start_lat']]
+    .to_dict('index')
+)
+
+pos = {n: (station_coords[n]['start_lng'], station_coords[n]['start_lat'])
+       for n in G.nodes if n in station_coords}
+
+# Remove self-loops to avoid distracting circular edges
+G.remove_edges_from(nx.selfloop_edges(G))
+
+plt.figure(figsize=(8, 10))
+nx.draw_networkx_edges(G, pos, edge_color='red', alpha=0.2, width=2, arrows=False)
+nx.draw_networkx_nodes(G, pos, node_size=6, node_color='dodgerblue', alpha=0.8)
+
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+plt.title("CitiBike Directed Graph (edges > 100 trips) — Jan 2023")
+plt.axis('equal')
+plt.show()
+num_nodes = G.number_of_nodes()
+num_edges = G.number_of_edges()
+
+print("Number of nodes:", num_nodes)
+print("Number of edges:", num_edges)
+
+# Rebuild thresholded graph and overlay on NYC basemap using Web Mercator projection
+edge_weights = (
+    janData.groupby(['start_station_name', 'end_station_name'])
+           .size()
+           .reset_index(name='weight')
+)
+
+G = nx.DiGraph()
+for _, r in edge_weights.iterrows():
+    if r['weight'] > 100:
+        G.add_edge(r['start_station_name'], r['end_station_name'], weight=r['weight'])
+
+station_coords = (
+    janData[['start_station_name','start_lat','start_lng']]
+    .drop_duplicates('start_station_name')
+    .set_index('start_station_name')[['start_lng','start_lat']]
+    .to_dict('index')
+)
+
+# Longitude/latitude to Web Mercator (EPSG:3857) for map alignment
+R = 6378137.0
+def mercator_xy(lon, lat):
+    x = R * np.deg2rad(lon)
+    y = R * np.log(np.tan(np.pi/4.0 + np.deg2rad(lat)/2.0))
+    return x, y
+
+pos_merc = {}
+for n in G.nodes():
+    if n in station_coords:
+        x, y = mercator_xy(station_coords[n]['start_lng'], station_coords[n]['start_lat'])
+        pos_merc[n] = (x, y)
+
+G.remove_edges_from(nx.selfloop_edges(G))
+
+# Basemap bounding box (must match nycmap.png export bounds)
+min_lon, max_lon = -74.30, -73.50
+min_lat, max_lat =  40.40,  41.10
+xmin, ymin = mercator_xy(min_lon, min_lat)
+xmax, ymax = mercator_xy(max_lon, max_lat)
+
+# Overlay the directed graph on the NYC basemap
+img = mpimg.imread("nycmap.png")
+fig, ax = plt.subplots(figsize=(8,10))
+ax.imshow(img, extent=[xmin, xmax, ymin, ymax], origin='upper')
+
+edges = list(G.edges(data=True))
+
+nx.draw_networkx_edges(
+    G, pos_merc, ax=ax,
+    width=2, edge_color='red', alpha=0.18, arrows=False
+)
+nx.draw_networkx_nodes(
+    G, pos_merc, ax=ax,
+    node_size=6, node_color='dodgerblue', alpha=0.9, edgecolors='none'
+)
+
+ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax)
+ax.set_aspect('equal', adjustable='box')
+ax.set_title("CitiBike Directed Graph (edges > 100 trips) over NYC Map — Jan 2023")
+plt.show()
+
+# Simple networkx position plot as sanity check
+pos = {row['start_station_name']: (row['start_lng'], row['start_lat'])
+       for _, row in janData.drop_duplicates('start_station_name').iterrows()}
+nx.draw(G, pos, node_size=5, alpha=0.6, arrows=False)
+
+import matplotlib.pyplot as plt
+
+# Plot ALL unique station locations (not just thresholded graph nodes)
+starts = janData[['start_station_name', 'start_lat', 'start_lng']].rename(
+    columns={'start_station_name':'station_name', 'start_lat':'lat', 'start_lng':'lng'}
+)
+ends = janData[['end_station_name', 'end_lat', 'end_lng']].rename(
+    columns={'end_station_name':'station_name', 'end_lat':'lat', 'end_lng':'lng'}
+)
+
+stations = (
+    pd.concat([starts, ends], ignore_index=True)
+      .dropna(subset=['lat', 'lng'])
+      .drop_duplicates(subset=['lat', 'lng'])
+)
+
+# Filter to NYC coordinate range
+stations = stations[
+    (stations['lat'].between(40.4, 41.1)) &
+    (stations['lng'].between(-74.3, -73.5))
+]
+
+plt.figure(figsize=(8, 10))
+plt.scatter(stations['lng'], stations['lat'], s=3, alpha=0.6, color='royalblue')
+plt.title("CitiBike Station Locations – Jan 2023", fontsize=14)
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+plt.axis('equal')
+plt.show()
+
+# Station locations overlaid on NYC basemap via Web Mercator
+R = 6378137.0
+def mercator_xy(lon, lat):
+    lon = np.asarray(lon, dtype=float)
+    lat = np.asarray(lat, dtype=float)
+    x = R * np.deg2rad(lon)
+    y = R * np.log(np.tan(np.pi/4.0 + np.deg2rad(lat)/2.0))
+    return x, y
+
+x_pts, y_pts = mercator_xy(stations['lng'].values, stations['lat'].values)
+
+min_lon, max_lon = -74.3, -73.5
+min_lat, max_lat =  40.4,  41.1
+xmin, ymin = mercator_xy(min_lon, min_lat)
+xmax, ymax = mercator_xy(max_lon, max_lat)
+
+img = mpimg.imread("nycmap.png")
+
+fig, ax = plt.subplots(figsize=(8,10))
+ax.imshow(img, extent=[xmin, xmax, ymin, ymax], origin='upper')
+ax.scatter(x_pts, y_pts, s=3, alpha=0.7, color='royalblue')
+
+ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax)
+ax.set_aspect('equal', adjustable='box')
+ax.set_title("CitiBike Station Locations over NYC Map — Jan 2023")
+ax.set_xlabel("Web Mercator X"); ax.set_ylabel("Web Mercator Y")
+plt.show()
+
+# -------------------- Additional EDA diagrams --------------------
+
+# Trip duration histogram (clipped at 60 min for readability)
+plt.figure(figsize=(8, 4))
+janData['trip_duration_mins'].clip(upper=60).hist(bins=60, edgecolor='white', alpha=0.8, color='steelblue')
+plt.axvline(janData['trip_duration_mins'].median(), color='red', linestyle='--', label=f"Median: {janData['trip_duration_mins'].median():.1f} min")
+plt.xlabel("Trip Duration (minutes)")
+plt.ylabel("Number of Trips")
+plt.title("Distribution of Trip Durations — January 2023")
+plt.legend()
+plt.tight_layout()
+plt.savefig("fig_trip_duration_distribution.png", dpi=250)
+plt.show()
+print("Saved fig_trip_duration_distribution.png")
+
+# Member vs casual rider comparison (count and median duration)
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+member_counts = janData['member_casual'].value_counts()
+axes[0].bar(member_counts.index.astype(str), member_counts.values, color=['steelblue', 'coral'])
+axes[0].set_ylabel("Number of Trips")
+axes[0].set_title("Trip Count by Rider Type")
+for i, v in enumerate(member_counts.values):
+    axes[0].text(i, v + 5000, f"{v:,}", ha='center', fontsize=9)
+
+janData.groupby('member_casual')['trip_duration_mins'].median().plot(
+    kind='bar', ax=axes[1], color=['steelblue', 'coral'], edgecolor='white'
+)
+axes[1].set_ylabel("Median Trip Duration (min)")
+axes[1].set_title("Median Trip Duration by Rider Type")
+axes[1].set_xticklabels(axes[1].get_xticklabels(), rotation=0)
+
+plt.suptitle("Member vs Casual Riders — January 2023", fontsize=13, y=1.02)
+plt.tight_layout()
+plt.savefig("fig_member_vs_casual.png", dpi=250, bbox_inches='tight')
+plt.show()
+print("Saved fig_member_vs_casual.png")
+
+# Edge weight distribution (linear and log scale)
+edge_weights_all = (
+    janData.groupby(['start_station_name', 'end_station_name'])
+           .size().reset_index(name='weight')
+)
+edge_weights_all = edge_weights_all[edge_weights_all['start_station_name'] != edge_weights_all['end_station_name']]
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].hist(edge_weights_all['weight'], bins=100, edgecolor='white', alpha=0.8, color='steelblue')
+axes[0].set_xlabel("Edge Weight (trip count)")
+axes[0].set_ylabel("Number of Station Pairs")
+axes[0].set_title("Edge Weight Distribution")
+
+axes[1].hist(np.log1p(edge_weights_all['weight']), bins=80, edgecolor='white', alpha=0.8, color='darkorange')
+axes[1].set_xlabel("log(1 + weight)")
+axes[1].set_ylabel("Number of Station Pairs")
+axes[1].set_title("Edge Weight Distribution (Log Scale)")
+
+plt.suptitle("Distribution of Directed Edge Weights — January 2023", fontsize=13, y=1.02)
+plt.tight_layout()
+plt.savefig("fig_weight_distribution.png", dpi=250, bbox_inches='tight')
+plt.show()
+print("Saved fig_weight_distribution.png")
+
+# In/out degree and strength distributions
+out_deg_full = janData.groupby('start_station_name')['end_station_name'].nunique()
+in_deg_full = janData.groupby('end_station_name')['start_station_name'].nunique()
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].hist(out_deg_full.values, bins=50, edgecolor='white', alpha=0.8, color='steelblue', label='Out-degree')
+axes[0].hist(in_deg_full.values, bins=50, edgecolor='white', alpha=0.6, color='coral', label='In-degree')
+axes[0].set_xlabel("Degree")
+axes[0].set_ylabel("Number of Stations")
+axes[0].set_title("Degree Distribution")
+axes[0].legend()
+
+out_str_full = janData.groupby('start_station_name').size()
+in_str_full = janData.groupby('end_station_name').size()
+axes[1].hist(np.log1p(out_str_full.values), bins=50, edgecolor='white', alpha=0.8, color='steelblue', label='Out-strength')
+axes[1].hist(np.log1p(in_str_full.values), bins=50, edgecolor='white', alpha=0.6, color='coral', label='In-strength')
+axes[1].set_xlabel("log(1 + strength)")
+axes[1].set_ylabel("Number of Stations")
+axes[1].set_title("Strength Distribution (Log Scale)")
+axes[1].legend()
+
+plt.suptitle("Degree and Strength Distributions — January 2023", fontsize=13, y=1.02)
+plt.tight_layout()
+plt.savefig("fig_degree_distribution.png", dpi=250, bbox_inches='tight')
+plt.show()
+print("Saved fig_degree_distribution.png")
+
+# Rendered summary statistics table as a figure
+total_trips = len(janData)
+unique_start = janData['start_station_name'].nunique()
+unique_end = janData['end_station_name'].nunique()
+unique_edges = len(edge_weights_all)
+avg_duration = janData['trip_duration_mins'].mean()
+med_duration = janData['trip_duration_mins'].median()
+pct_member = (janData['member_casual'] == 'member').mean() * 100
+pct_electric = (janData['rideable_type'] == 'electric_bike').mean() * 100
+
+stats_data = [
+    ["Total trips (after cleaning)", f"{total_trips:,}"],
+    ["Unique start stations", f"{unique_start:,}"],
+    ["Unique end stations", f"{unique_end:,}"],
+    ["Unique directed edges", f"{unique_edges:,}"],
+    ["Mean trip duration", f"{avg_duration:.1f} min"],
+    ["Median trip duration", f"{med_duration:.1f} min"],
+    ["Member riders", f"{pct_member:.1f}%"],
+    ["Electric bikes", f"{pct_electric:.1f}%"],
+    ["Date range", "Jan 1–31, 2023"],
+]
+
+fig, ax = plt.subplots(figsize=(6, 3.5))
+ax.axis('off')
+table = ax.table(cellText=stats_data,
+                 colLabels=["Statistic", "Value"],
+                 loc='center',
+                 cellLoc='left')
+table.auto_set_font_size(False)
+table.set_fontsize(10)
+table.scale(1.2, 1.6)
+for (row, col), cell in table.get_celld().items():
+    if row == 0:
+        cell.set_facecolor('#2c3e50')
+        cell.set_text_props(color='white', fontweight='bold')
+    else:
+        cell.set_facecolor('#ecf0f1' if row % 2 == 0 else 'white')
+plt.title("Dataset Summary — CitiBike January 2023", fontsize=12, fontweight='bold', pad=20)
+plt.tight_layout()
+plt.savefig("fig_graph_summary_stats.png", dpi=250, bbox_inches='tight')
+plt.show()
+print("Saved fig_graph_summary_stats.png")
